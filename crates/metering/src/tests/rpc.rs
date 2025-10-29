@@ -6,6 +6,7 @@ mod tests {
     use alloy_genesis::Genesis;
     use alloy_primitives::{Bytes, U256, address, b256, bytes};
     use alloy_rpc_client::RpcClient;
+    use base_reth_flashblocks_rpc::state::FlashblocksState;
     use base_reth_test_utils::tracing::init_silenced_tracing;
     use op_alloy_consensus::OpTxEnvelope;
     use reth::{
@@ -59,6 +60,7 @@ mod tests {
         let tasks = TaskManager::current();
         let exec = tasks.executor();
         const BASE_SEPOLIA_CHAIN_ID: u64 = 84532;
+        const MAX_PENDING_BLOCKS_DEPTH: u64 = 5;
 
         let genesis: Genesis = serde_json::from_str(include_str!("assets/genesis.json")).unwrap();
         let chain_spec = Arc::new(
@@ -87,7 +89,12 @@ mod tests {
             .with_components(node.components_builder())
             .with_add_ons(node.add_ons())
             .extend_rpc_modules(move |ctx| {
-                let metering_api = MeteringApiImpl::new(ctx.provider().clone());
+                // Create a FlashblocksState without starting it (no pending blocks for testing)
+                let flashblocks_state = Arc::new(FlashblocksState::new(
+                    ctx.provider().clone(),
+                    MAX_PENDING_BLOCKS_DEPTH,
+                ));
+                let metering_api = MeteringApiImpl::new(ctx.provider().clone(), flashblocks_state);
                 ctx.modules.merge_configured(metering_api.into_rpc())?;
                 Ok(())
             })
