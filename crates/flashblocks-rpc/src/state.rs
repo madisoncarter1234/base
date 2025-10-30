@@ -36,12 +36,8 @@ use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_primitives::{DepositReceipt, OpBlock, OpPrimitives};
 use reth_optimism_rpc::OpReceiptBuilder;
 use reth_primitives::RecoveredBlock;
-use reth_rpc_convert::transaction::ConvertReceiptInput;
-use tokio::sync::{
-    Mutex,
-    broadcast::{self, Sender},
-    mpsc::{self, UnboundedReceiver},
-};
+use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcTransaction};
+use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 use tracing::{debug, error, info, warn};
 
 use crate::{
