@@ -60,3 +60,29 @@ Note: While some fields like `revertingTxHashes` are part of the TIPS Bundle for
 - Stops on first failure
 - Automatically registered in `base` namespace
 
+## Upcoming Features
+
+- **In-memory metering cache:** Maintains per-flashblock resource snapshots (gas, DA bytes,
+  execution time, state-root time) for the latest 12 blocks to support pricing decisions.
+- **Stream ingestion:** Background tasks will hydrate the cache by consuming the TIPS Kafka
+  feed (for timing metrics) and the flashblocks websocket stream (for inclusion order).
+- **Priority-fee estimator:** Aggregates cached data in ascending priority-fee order to
+  project the fee a bundle must pay to satisfy each resource constraint, including
+  percentile-based recommendations.
+- **`base_meteredPriorityFeePerGas` RPC:** Accepts a TIPS Bundle, meters it locally, and
+  responds with per-resource fee suggestions for each flashblock index plus aggregated
+  min/max guidance for next-block and next-flashblock inclusion.
+
+## Testing & Observability Plan
+
+- **Unit coverage:** Exercise cache eviction, transaction ordering, and estimator threshold
+  logic with synthetic datasets (see `cache.rs` and `estimator.rs` tests). Extend with Kafka
+  parsing tests once the ingest message schema is integrated.
+- **Integration harness:** Feed mocked Kafka + websocket streams into the ingest pipeline to
+  validate cache hydration and end-to-end RPC responses. Leverage existing async test
+  utilities in the workspace for deterministic sequencing.
+- **Property-style checks:** Generate random transaction fee/usage distributions to ensure the
+  estimator produces monotonic thresholds and sensible percentiles across resource types.
+- **Metrics & tracing:** Emit gauges for cache freshness (latest block/index), Kafka lag,
+  websocket heartbeat, and estimator latency. Reuse the existing `tracing` instrumentation
+  pattern in the repo so operators can alert on stale data paths.
