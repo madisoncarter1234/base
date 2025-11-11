@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use reth::api::{NodeTypes, NodeTypesWithDBAdapter};
 use reth_db::{
@@ -18,6 +18,14 @@ pub fn create_provider_factory<N: NodeTypes>(
         chain_spec,
         StaticFileProvider::read_write(static_dir.keep()).expect("static file provider"),
     )
+}
+
+static TRACING_INIT: Once = Once::new();
+
+pub fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt::try_init();
+    });
 }
 
 fn create_test_db() -> Arc<TempDatabase<DatabaseEnv>> {

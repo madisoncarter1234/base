@@ -123,6 +123,8 @@ struct MeteringRuntime {
 
 struct CompositeFlashblocksReceiver<Client> {
     state: Arc<FlashblocksState<Client>>,
+    /// Optional channel for the metering pipeline; flashblocks RPC still needs the stream even
+    /// when metering is disabled, so we only forward inclusions if a sender is provided.
     metering_sender: Option<mpsc::UnboundedSender<FlashblockInclusion>>,
 }
 
@@ -144,24 +146,34 @@ where
     FlashblocksState<Client>: base_reth_flashblocks_rpc::subscription::FlashblocksReceiver,
 {
     fn on_flashblock_received(&self, flashblock: Flashblock) {
+        metrics::counter!("metering.flashblocks.received").increment(1);
+        metrics::gauge!("metering.flashblocks.index").set(flashblock.index as f64);
+        metrics::gauge!("metering.flashblocks.transactions")
+            .set(flashblock.diff.transactions.len() as f64);
+        metrics::gauge!("metering.flashblocks.block_number")
+            .set(flashblock.metadata.block_number as f64);
+
         self.state.on_flashblock_received(flashblock.clone());
 
-        if let Some(sender) = &self.metering_sender {
-            if let Some(inclusion) = flashblock_inclusion_from_flashblock(&flashblock) {
-                if let Err(err) = sender.send(inclusion) {
-                    warn!(
-                        target: "metering::flashblocks",
-                        %err,
-                        "Failed to forward flashblock inclusion to metering"
-                    );
-                }
-            }
+        let Some(sender) = &self.metering_sender else {
+            return;
+        };
+        let Some(inclusion) = flashblock_inclusion_from_flashblock(&flashblock) else {
+            return;
+        };
+
+        if sender.send(inclusion).is_err() {
+            warn!(
+                target: "metering::flashblocks",
+                "Failed to forward flashblock inclusion to metering"
+            );
         }
     }
 }
 
 fn flashblock_inclusion_from_flashblock(flashblock: &Flashblock) -> Option<FlashblockInclusion> {
     if flashblock.diff.transactions.is_empty() {
+        metrics::counter!("metering.flashblocks.empty").increment(1);
         return None;
     }
 
@@ -234,7 +246,9 @@ fn main() {
 
                 // Drain snapshot channel until downstream consumers are attached.
                 tokio::spawn(async move {
-                    while snapshot_receiver.recv().await.is_some() {}
+                    while snapshot_receiver.recv().await.is_some() {
+                        metrics::counter!("metering.snapshots.dropped").increment(1);
+                    }
                 });
 
                 let ingest_cache = cache.clone();

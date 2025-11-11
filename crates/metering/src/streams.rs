@@ -3,7 +3,7 @@ use alloy_primitives::TxHash;
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Message emitted by the Kafka ingest task once a transaction has been processed.
 #[derive(Debug)]
@@ -54,6 +54,7 @@ impl StreamsIngest {
     }
 
     pub async fn run(mut self) {
+        info!(target: "metering::streams", "Starting StreamsIngest loop");
         loop {
             tokio::select! {
                 Some(tx_event) = self.tx_updates_rx.recv() => {
@@ -63,6 +64,7 @@ impl StreamsIngest {
                     self.handle_flashblock_event(flashblock_event);
                 }
                 else => {
+                    info!(target: "metering::streams", "StreamsIngest loop terminating");
                     break;
                 }
             }
@@ -82,9 +84,13 @@ impl StreamsIngest {
             event.flashblock_index,
             event.transaction,
         );
+        let block_count = cache.len();
+        metrics::gauge!("metering.cache.window_depth").set(block_count as f64);
+        metrics::counter!("metering.cache.tx_events_total").increment(1);
     }
 
     fn handle_flashblock_event(&mut self, event: FlashblockInclusion) {
+        metrics::counter!("metering.streams.flashblocks_total").increment(1);
         let transactions = {
             let cache = self.cache.read();
             if let Some(flashblock) = cache.flashblock(event.block_number, event.flashblock_index) {
@@ -103,6 +109,7 @@ impl StreamsIngest {
                     flashblock_index = event.flashblock_index,
                     "Flashblock inclusion arrived before transactions were cached"
                 );
+                metrics::counter!("metering.streams.misses_total").increment(1);
                 return;
             }
         };
@@ -113,8 +120,12 @@ impl StreamsIngest {
                 flashblock_index = event.flashblock_index,
                 "Received flashblock inclusion with no matching cached transactions"
             );
+            metrics::counter!("metering.streams.misses_total").increment(1);
             return;
         }
+
+        metrics::gauge!("metering.streams.transactions_in_flashblock")
+            .set(transactions.len() as f64);
 
         let snapshot = FlashblockSnapshot {
             block_number: event.block_number,
@@ -124,6 +135,7 @@ impl StreamsIngest {
 
         if let Err(e) = self.snapshot_tx.send(snapshot) {
             error!(error = %e, "Failed to send flashblock snapshot");
+            metrics::counter!("metering.streams.snapshot_errors").increment(1);
         }
     }
 }

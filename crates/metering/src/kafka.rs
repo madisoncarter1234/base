@@ -3,6 +3,7 @@ use alloy_consensus::Transaction;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::Encodable2718;
 use alloy_primitives::U256;
+use chrono::Utc;
 use eyre::Result;
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_flz::tx_estimated_size_fjord_bytes;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use tips_core::types::AcceptedBundle;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Configuration required to connect to the Kafka topic publishing accepted bundles.
 pub struct KafkaBundleConsumerConfig {
@@ -49,11 +50,18 @@ impl KafkaBundleConsumer {
 
     /// Starts listening for Kafka messages until the task is cancelled.
     pub async fn run(self) {
+        info!(
+            target: "metering::kafka",
+            topic = %self.topic,
+            "Starting Kafka bundle consumer"
+        );
+
         loop {
             match self.consumer.recv().await {
                 Ok(message) => {
                     if let Err(err) = self.handle_message(message).await {
                         error!(target: "metering::kafka", error = %err, "Failed to process Kafka message");
+                        metrics::counter!("metering.kafka.errors_total").increment(1);
                     }
                 }
                 Err(err) => {
@@ -63,6 +71,7 @@ impl KafkaBundleConsumer {
                         "Kafka receive error for topic {}. Retrying in 1s",
                         self.topic
                     );
+                    metrics::counter!("metering.kafka.errors_total").increment(1);
                     sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -75,6 +84,15 @@ impl KafkaBundleConsumer {
             .ok_or_else(|| eyre::eyre!("Kafka message missing payload"))?;
 
         let bundle: AcceptedBundle = serde_json::from_slice(payload)?;
+        metrics::counter!("metering.kafka.messages_total").increment(1);
+
+        if let Some(ts) = message.timestamp().to_millis() {
+            let now_ms = Utc::now().timestamp_millis();
+            let lag_ms = now_ms.saturating_sub(ts);
+            metrics::gauge!("metering.kafka.lag_ms").set(lag_ms as f64);
+        }
+
+        metrics::gauge!("metering.cache.latest_block").set(bundle.block_number as f64);
         debug!(
             target: "metering::kafka",
             block_number = bundle.block_number,
@@ -84,6 +102,7 @@ impl KafkaBundleConsumer {
 
         if let Some(flashblock_index) = bundle.meter_bundle_response.state_flashblock_index {
             self.publish_transactions(&bundle, flashblock_index)?;
+            metrics::gauge!("metering.cache.latest_flashblock_index").set(flashblock_index as f64);
         } else {
             warn!(
                 target: "metering::kafka",
@@ -91,6 +110,7 @@ impl KafkaBundleConsumer {
                 uuid = %bundle.uuid(),
                 "Skipping bundle without flashblock index"
             );
+            metrics::counter!("metering.kafka.messages_skipped").increment(1);
         }
 
         // Best-effort asynchronous commit.
@@ -100,6 +120,7 @@ impl KafkaBundleConsumer {
                 error = %err,
                 "Failed to commit Kafka offset asynchronously"
             );
+            metrics::counter!("metering.kafka.errors_total").increment(1);
         }
 
         Ok(())
@@ -114,8 +135,12 @@ impl KafkaBundleConsumer {
                 result_count = bundle.meter_bundle_response.results.len(),
                 "Bundle transactions/results length mismatch; skipping"
             );
+            metrics::counter!("metering.kafka.messages_skipped").increment(1);
             return Ok(());
         }
+
+        // TODO: replace with real cache depth once Kafka consumer can access shared state.
+        metrics::gauge!("metering.cache.window_depth").set(0.0);
 
         for (tx, result) in bundle
             .txs
@@ -146,6 +171,7 @@ impl KafkaBundleConsumer {
                     error = %err,
                     "Failed to send metered transaction event"
                 );
+                metrics::counter!("metering.kafka.errors_total").increment(1);
             }
         }
 

@@ -74,6 +74,16 @@ Note: While some fields like `revertingTxHashes` are part of the TIPS Bundle for
   min/max guidance for next-block and next-flashblock inclusion. Currently returns an error
   until the ingestion tasks populate the metering cache.
 
+### Observability Contract
+
+- **Gauges**: `metering.kafka.lag_ms`, `metering.cache.latest_block`, `metering.cache.window_depth`
+  track data freshness and cache depth.
+- **Counters**: `metering.kafka.messages_total`, `metering.kafka.errors_total`,
+  `metering.kafka.messages_skipped`, `metering.streams.flashblocks_total`,
+  `metering.streams.misses_total`, `metering.cache.tx_events_total` capture ingestion health.
+- Detailed per-transaction diagnostics (missing flashblock index, snapshot drops) are emitted as
+  structured tracing events instead of high-cardinality metrics.
+
 ## Testing & Observability Plan
 
 - **Unit coverage:** Exercise cache eviction, transaction ordering, and estimator threshold
