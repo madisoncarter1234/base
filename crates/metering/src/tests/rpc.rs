@@ -460,8 +460,9 @@ mod tests {
 
         let bundle = create_bundle(vec![], 0, None);
 
-        let response: Result<crate::MeteredPriorityFeeResponse, _> =
-            client.request("base_meteredPriorityFeePerGas", (bundle,)).await;
+        let response: Result<crate::MeteredPriorityFeeResponse, _> = client
+            .request("base_meteredPriorityFeePerGas", (bundle,))
+            .await;
 
         assert!(response.is_err());
         let err = response.unwrap_err();

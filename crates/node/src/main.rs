@@ -1,30 +1,35 @@
+use alloy_primitives::{TxHash, keccak256};
 use base_reth_flashblocks_rpc::rpc::{EthApiExt, EthApiOverrideServer};
-use futures_util::TryStreamExt;
-use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
-use reth::version::{
-    RethCliVersionConsts, default_reth_version_metadata, try_init_version_metadata,
-};
-use reth_exex::ExExEvent;
-use std::sync::Arc;
-
 use base_reth_flashblocks_rpc::state::FlashblocksState;
-use base_reth_flashblocks_rpc::subscription::FlashblocksSubscriber;
+use base_reth_flashblocks_rpc::subscription::{Flashblock, FlashblocksSubscriber};
 use base_reth_metering::{
-    DEFAULT_PRIORITY_FEE_PERCENTILE, MeteringApiImpl, MeteringApiServer, MeteringCache,
-    PriorityFeeEstimator,
+    DEFAULT_PRIORITY_FEE_PERCENTILE, FlashblockInclusion, FlashblockSnapshot, KafkaBundleConsumer,
+    KafkaBundleConsumerConfig, MeteringApiImpl, MeteringApiServer, MeteringCache,
+    PriorityFeeEstimator, StreamsIngest, TxMeteringEvent,
 };
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
+use eyre::bail;
+use futures_util::TryStreamExt;
+use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
+use rdkafka::config::ClientConfig;
 use reth::builder::{Node, NodeHandle};
+use reth::version::{
+    RethCliVersionConsts, default_reth_version_metadata, try_init_version_metadata,
+};
 use reth::{
     builder::{EngineNodeLauncher, TreeConfig},
     providers::providers::BlockchainProvider,
 };
+use reth_exex::ExExEvent;
 use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
 use reth_optimism_node::OpNode;
 use reth_optimism_node::args::RollupArgs;
-use tracing::info;
+use std::sync::Arc;
+use tips_core::kafka::load_kafka_config_from_file;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 use url::Url;
 
 pub const NODE_RETH_CLIENT_VERSION: &str = concat!("base/v", env!("CARGO_PKG_VERSION"));
@@ -58,12 +63,120 @@ struct Args {
     /// Enable metering RPC for transaction bundle simulation
     #[arg(long = "enable-metering", value_name = "ENABLE_METERING")]
     pub enable_metering: bool,
+
+    /// Kafka brokers (comma-separated) publishing accepted bundle events for metering.
+    #[arg(long = "metering-kafka-brokers")]
+    pub metering_kafka_brokers: Option<String>,
+
+    /// Kafka topic carrying accepted bundle events.
+    #[arg(long = "metering-kafka-topic")]
+    pub metering_kafka_topic: Option<String>,
+
+    /// Kafka consumer group id for metering ingestion.
+    #[arg(long = "metering-kafka-group-id")]
+    pub metering_kafka_group_id: Option<String>,
+
+    /// Optional Kafka properties file (key=value per line) merged into the consumer config.
+    #[arg(long = "metering-kafka-properties-file")]
+    pub metering_kafka_properties_file: Option<String>,
 }
 
 impl Args {
     fn flashblocks_enabled(&self) -> bool {
         self.websocket_url.is_some()
     }
+
+    fn metering_kafka_settings(&self) -> Option<MeteringKafkaSettings> {
+        if !self.enable_metering {
+            return None;
+        }
+
+        let brokers = self.metering_kafka_brokers.clone()?;
+        let topic = self.metering_kafka_topic.clone()?;
+        let group_id = self.metering_kafka_group_id.clone()?;
+
+        Some(MeteringKafkaSettings {
+            brokers,
+            topic,
+            group_id,
+            properties_file: self.metering_kafka_properties_file.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MeteringKafkaSettings {
+    brokers: String,
+    topic: String,
+    group_id: String,
+    properties_file: Option<String>,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct MeteringRuntime {
+    cache: Arc<RwLock<MeteringCache>>,
+    estimator: Arc<PriorityFeeEstimator>,
+    tx_sender: mpsc::UnboundedSender<TxMeteringEvent>,
+    flashblock_sender: mpsc::UnboundedSender<FlashblockInclusion>,
+}
+
+struct CompositeFlashblocksReceiver<Client> {
+    state: Arc<FlashblocksState<Client>>,
+    metering_sender: Option<mpsc::UnboundedSender<FlashblockInclusion>>,
+}
+
+impl<Client> CompositeFlashblocksReceiver<Client> {
+    fn new(
+        state: Arc<FlashblocksState<Client>>,
+        metering_sender: Option<mpsc::UnboundedSender<FlashblockInclusion>>,
+    ) -> Self {
+        Self {
+            state,
+            metering_sender,
+        }
+    }
+}
+
+impl<Client> base_reth_flashblocks_rpc::subscription::FlashblocksReceiver
+    for CompositeFlashblocksReceiver<Client>
+where
+    FlashblocksState<Client>: base_reth_flashblocks_rpc::subscription::FlashblocksReceiver,
+{
+    fn on_flashblock_received(&self, flashblock: Flashblock) {
+        self.state.on_flashblock_received(flashblock.clone());
+
+        if let Some(sender) = &self.metering_sender {
+            if let Some(inclusion) = flashblock_inclusion_from_flashblock(&flashblock) {
+                if let Err(err) = sender.send(inclusion) {
+                    warn!(
+                        target: "metering::flashblocks",
+                        %err,
+                        "Failed to forward flashblock inclusion to metering"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn flashblock_inclusion_from_flashblock(flashblock: &Flashblock) -> Option<FlashblockInclusion> {
+    if flashblock.diff.transactions.is_empty() {
+        return None;
+    }
+
+    let ordered_tx_hashes: Vec<TxHash> = flashblock
+        .diff
+        .transactions
+        .iter()
+        .map(|tx_bytes| TxHash::from(keccak256(tx_bytes)))
+        .collect();
+
+    Some(FlashblockInclusion {
+        block_number: flashblock.metadata.block_number,
+        flashblock_index: flashblock.index,
+        ordered_tx_hashes,
+    })
 }
 
 fn main() {
@@ -97,20 +210,99 @@ fn main() {
             let flashblocks_enabled = args.flashblocks_enabled();
             let transaction_tracing_enabled = args.enable_transaction_tracing;
             let metering_enabled = args.enable_metering;
+            let kafka_settings = args.metering_kafka_settings();
+            if metering_enabled && kafka_settings.is_none() {
+                bail!(
+                    "Metering requires Kafka configuration: provide --metering-kafka-brokers, --metering-kafka-topic, and --metering-kafka-group-id"
+                );
+            }
+
             let op_node = OpNode::new(args.rollup_args.clone());
 
-            let metering_state: Option<(Arc<RwLock<MeteringCache>>, Arc<PriorityFeeEstimator>)> =
-                metering_enabled.then(|| {
-                    let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
-                    let estimator = Arc::new(PriorityFeeEstimator::new(
-                        cache.clone(),
-                        DEFAULT_PRIORITY_FEE_PERCENTILE,
-                    ));
-                    (cache, estimator)
+            let metering_runtime = if metering_enabled {
+                let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+                let estimator = Arc::new(PriorityFeeEstimator::new(
+                    cache.clone(),
+                    DEFAULT_PRIORITY_FEE_PERCENTILE,
+                ));
+
+                let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<TxMeteringEvent>();
+                let (flashblock_sender, flashblock_receiver) =
+                    mpsc::unbounded_channel::<FlashblockInclusion>();
+                let (snapshot_sender, mut snapshot_receiver) =
+                    mpsc::unbounded_channel::<FlashblockSnapshot>();
+
+                // Drain snapshot channel until downstream consumers are attached.
+                tokio::spawn(async move {
+                    while snapshot_receiver.recv().await.is_some() {}
                 });
 
+                let ingest_cache = cache.clone();
+                tokio::spawn(async move {
+                    StreamsIngest::new(ingest_cache, tx_receiver, flashblock_receiver, snapshot_sender)
+                        .run()
+                        .await;
+                });
+
+                Some(MeteringRuntime {
+                    cache,
+                    estimator,
+                    tx_sender,
+                    flashblock_sender,
+                })
+            } else {
+                None
+            };
+
+            let metering_runtime_for_flashblocks = metering_runtime.clone();
+
+            if let (Some(runtime), Some(settings)) = (metering_runtime.clone(), kafka_settings) {
+                let mut client_config = ClientConfig::new();
+                client_config.set("bootstrap.servers", &settings.brokers);
+                client_config.set("group.id", &settings.group_id);
+                client_config.set("enable.partition.eof", "false");
+                client_config.set("session.timeout.ms", "6000");
+                client_config.set("enable.auto.commit", "true");
+                client_config.set("auto.offset.reset", "earliest");
+
+                if let Some(path) = settings.properties_file.as_ref() {
+                    match load_kafka_config_from_file(path) {
+                        Ok(props) => {
+                            for (key, value) in props {
+                                client_config.set(key, value);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                message = "Failed to load Kafka properties file",
+                                file = %path,
+                                %err
+                            );
+                        }
+                    }
+                }
+
+                let tx_sender = runtime.tx_sender.clone();
+                let topic = settings.topic.clone();
+                tokio::spawn(async move {
+                    let config = KafkaBundleConsumerConfig {
+                        client_config,
+                        topic,
+                    };
+
+                    match KafkaBundleConsumer::new(config, tx_sender) {
+                        Ok(consumer) => consumer.run().await,
+                        Err(err) => error!(
+                            target: "metering::kafka",
+                            %err,
+                            "Failed to initialize Kafka consumer"
+                        ),
+                    }
+                });
+            }
+
             let fb_cell: Arc<OnceCell<Arc<FlashblocksState<_>>>> = Arc::new(OnceCell::new());
-            let metering_state_for_rpc = metering_state.clone();
+            let metering_runtime_for_rpc = metering_runtime.clone();
 
             let NodeHandle {
                 node: _node,
@@ -154,9 +346,9 @@ fn main() {
                 .extend_rpc_modules(move |ctx| {
                     if metering_enabled {
                         info!(message = "Starting Metering RPC");
-                        let estimator = metering_state_for_rpc
+                        let estimator = metering_runtime_for_rpc
                             .as_ref()
-                            .map(|(_, estimator)| estimator.clone())
+                            .map(|runtime| runtime.estimator.clone())
                             .expect("metering estimator should be initialized");
                         let metering_api = MeteringApiImpl::new(ctx.provider().clone(), estimator);
                         ctx.modules.merge_configured(metering_api.into_rpc())?;
@@ -176,7 +368,15 @@ fn main() {
                             .clone();
                         fb.start();
 
-                        let mut flashblocks_client = FlashblocksSubscriber::new(fb.clone(), ws_url);
+                        let metering_sender = metering_runtime_for_flashblocks
+                            .as_ref()
+                            .map(|runtime| runtime.flashblock_sender.clone());
+                        let receiver = Arc::new(CompositeFlashblocksReceiver::new(
+                            fb.clone(),
+                            metering_sender,
+                        ));
+
+                        let mut flashblocks_client = FlashblocksSubscriber::new(receiver, ws_url);
                         flashblocks_client.start();
 
                         let api_ext = EthApiExt::new(

@@ -87,6 +87,8 @@ time.workspace = true
 chrono.workspace = true
 once_cell.workspace = true
 parking_lot.workspace = true
+rdkafka.workspace = true
+tips-core.workspace = true
 
 [features]
 default = []

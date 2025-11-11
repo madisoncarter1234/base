@@ -49,6 +49,8 @@ eyre.workspace = true
 indexmap.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
+rdkafka.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 alloy-genesis.workspace = true
@@ -61,4 +63,3 @@ reth-optimism-node.workspace = true
 reth-testing-utils.workspace = true
 reth-tracing.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-serde_json.workspace = true

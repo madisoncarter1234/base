@@ -1,5 +1,6 @@
 mod cache;
 mod estimator;
+mod kafka;
 mod meter;
 mod rpc;
 mod streams;
@@ -13,6 +14,7 @@ pub use estimator::{
     BlockPriorityEstimates, FlashblockResourceEstimates, PriorityFeeEstimator, ResourceDemand,
     ResourceEstimate, ResourceKind,
 };
+pub use kafka::{KafkaBundleConsumer, KafkaBundleConsumerConfig};
 pub use meter::meter_bundle;
 pub use rpc::{
     DEFAULT_PRIORITY_FEE_PERCENTILE, MeteredPriorityFeeResponse, MeteringApiImpl, MeteringApiServer,
