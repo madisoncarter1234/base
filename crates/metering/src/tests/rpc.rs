@@ -1,12 +1,16 @@
 #[cfg(test)]
 mod tests {
-    use crate::rpc::{MeteringApiImpl, MeteringApiServer};
+    use crate::{
+        DEFAULT_PRIORITY_FEE_PERCENTILE, MeteringApiImpl, MeteringApiServer, MeteringCache,
+        PriorityFeeEstimator,
+    };
     use alloy_eips::Encodable2718;
     use alloy_genesis::Genesis;
     use alloy_primitives::bytes;
     use alloy_primitives::{Bytes, U256, address, b256};
     use alloy_rpc_client::RpcClient;
     use op_alloy_consensus::OpTxEnvelope;
+    use parking_lot::RwLock;
     use reth::args::{DiscoveryArgs, NetworkArgs, RpcServerArgs};
     use reth::builder::{Node, NodeBuilder, NodeConfig, NodeHandle};
     use reth::chainspec::Chain;
@@ -82,6 +86,13 @@ mod tests {
 
         let node = OpNode::new(RollupArgs::default());
 
+        let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+        let estimator = Arc::new(PriorityFeeEstimator::new(
+            cache.clone(),
+            DEFAULT_PRIORITY_FEE_PERCENTILE,
+        ));
+        let estimator_for_rpc = estimator.clone();
+
         let NodeHandle {
             node,
             node_exit_future,
@@ -91,7 +102,8 @@ mod tests {
             .with_components(node.components_builder())
             .with_add_ons(node.add_ons())
             .extend_rpc_modules(move |ctx| {
-                let metering_api = MeteringApiImpl::new(ctx.provider().clone());
+                let metering_api =
+                    MeteringApiImpl::new(ctx.provider().clone(), estimator_for_rpc.clone());
                 ctx.modules.merge_configured(metering_api.into_rpc())?;
                 Ok(())
             })
@@ -436,6 +448,28 @@ mod tests {
 
         // Bundle gas price should be weighted average: (3*21000 + 7*21000) / (21000 + 21000) = 5 gwei
         assert_eq!(response.bundle_gas_price, "5000000000");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metered_priority_fee_requires_history() -> eyre::Result<()> {
+        reth_tracing::init_test_tracing();
+        let node = setup_node().await?;
+        let client = node.rpc_client().await?;
+
+        let bundle = create_bundle(vec![], 0, None);
+
+        let response: Result<crate::MeteredPriorityFeeResponse, _> =
+            client.request("base_meteredPriorityFeePerGas", (bundle,)).await;
+
+        assert!(response.is_err());
+        let err = response.unwrap_err();
+        let err_str = format!("{err}");
+        assert!(
+            err_str.contains("Priority fee data unavailable"),
+            "unexpected error: {err_str}"
+        );
 
         Ok(())
     }

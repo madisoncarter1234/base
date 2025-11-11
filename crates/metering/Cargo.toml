@@ -34,6 +34,7 @@ alloy-eips.workspace = true
 
 # op-alloy
 op-alloy-consensus.workspace = true
+op-alloy-flz.workspace = true
 
 # revm
 revm.workspace = true

@@ -1,16 +1,19 @@
-use base_reth_flashblocks_rpc::rpc::EthApiExt;
+use base_reth_flashblocks_rpc::rpc::{EthApiExt, EthApiOverrideServer};
 use futures_util::TryStreamExt;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use reth::version::{
     RethCliVersionConsts, default_reth_version_metadata, try_init_version_metadata,
 };
 use reth_exex::ExExEvent;
 use std::sync::Arc;
 
-use base_reth_flashblocks_rpc::rpc::EthApiOverrideServer;
 use base_reth_flashblocks_rpc::state::FlashblocksState;
 use base_reth_flashblocks_rpc::subscription::FlashblocksSubscriber;
-use base_reth_metering::{MeteringApiImpl, MeteringApiServer};
+use base_reth_metering::{
+    DEFAULT_PRIORITY_FEE_PERCENTILE, MeteringApiImpl, MeteringApiServer, MeteringCache,
+    PriorityFeeEstimator,
+};
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
 use reth::builder::{Node, NodeHandle};
@@ -96,7 +99,18 @@ fn main() {
             let metering_enabled = args.enable_metering;
             let op_node = OpNode::new(args.rollup_args.clone());
 
+            let metering_state: Option<(Arc<RwLock<MeteringCache>>, Arc<PriorityFeeEstimator>)> =
+                metering_enabled.then(|| {
+                    let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+                    let estimator = Arc::new(PriorityFeeEstimator::new(
+                        cache.clone(),
+                        DEFAULT_PRIORITY_FEE_PERCENTILE,
+                    ));
+                    (cache, estimator)
+                });
+
             let fb_cell: Arc<OnceCell<Arc<FlashblocksState<_>>>> = Arc::new(OnceCell::new());
+            let metering_state_for_rpc = metering_state.clone();
 
             let NodeHandle {
                 node: _node,
@@ -140,7 +154,11 @@ fn main() {
                 .extend_rpc_modules(move |ctx| {
                     if metering_enabled {
                         info!(message = "Starting Metering RPC");
-                        let metering_api = MeteringApiImpl::new(ctx.provider().clone());
+                        let estimator = metering_state_for_rpc
+                            .as_ref()
+                            .map(|(_, estimator)| estimator.clone())
+                            .expect("metering estimator should be initialized");
+                        let metering_api = MeteringApiImpl::new(ctx.provider().clone(), estimator);
                         ctx.modules.merge_configured(metering_api.into_rpc())?;
                     }
 

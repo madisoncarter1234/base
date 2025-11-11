@@ -86,6 +86,7 @@ uuid.workspace = true
 time.workspace = true
 chrono.workspace = true
 once_cell.workspace = true
+parking_lot.workspace = true
 
 [features]
 default = []

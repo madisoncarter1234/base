@@ -68,10 +68,11 @@ Note: While some fields like `revertingTxHashes` are part of the TIPS Bundle for
   feed (for timing metrics) and the flashblocks websocket stream (for inclusion order).
 - **Priority-fee estimator:** Aggregates cached data in ascending priority-fee order to
   project the fee a bundle must pay to satisfy each resource constraint, including
-  percentile-based recommendations.
+  percentile-based recommendations. (Core logic implemented; awaiting live data feed.)
 - **`base_meteredPriorityFeePerGas` RPC:** Accepts a TIPS Bundle, meters it locally, and
   responds with per-resource fee suggestions for each flashblock index plus aggregated
-  min/max guidance for next-block and next-flashblock inclusion.
+  min/max guidance for next-block and next-flashblock inclusion. Currently returns an error
+  until the ingestion tasks populate the metering cache.
 
 ## Testing & Observability Plan
 
