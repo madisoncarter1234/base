@@ -142,8 +142,6 @@ fn meter_bundle_empty_transactions() -> eyre::Result<()> {
         &harness.header,
         None,
         None,
-        None,
-        None,
     )?;
 
     assert!(output.results.is_empty());
@@ -191,8 +189,6 @@ fn meter_bundle_single_transaction() -> eyre::Result<()> {
         harness.chain_spec.clone(),
         parsed_bundle,
         &harness.header,
-        None,
-        None,
         None,
         None,
     )?;
@@ -367,10 +363,7 @@ fn meter_bundle_state_root_time_invariant() -> eyre::Result<()> {
     );
 
     // State root time should be non-zero
-    assert!(
-        output.state_root_time_us > 0,
-        "state_root_time_us should be greater than zero"
-    );
+    assert!(output.state_root_time_us > 0, "state_root_time_us should be greater than zero");
 
     Ok(())
 }

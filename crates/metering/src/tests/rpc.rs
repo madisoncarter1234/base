@@ -1,27 +1,27 @@
-use crate::rpc::{MeteringApiImpl, MeteringApiServer};
 use alloy_eips::Encodable2718;
-use alloy_primitives::{address, Bytes, U256};
+use alloy_primitives::{Bytes, U256, address};
 use alloy_provider::Provider;
-use base_reth_test_utils::harness::TestHarness;
-use base_reth_test_utils::node::{
-    default_launcher, LocalFlashblocksState, LocalNodeProvider, BASE_CHAIN_ID,
+use base_reth_test_utils::{
+    flashblocks_harness::FlashblocksHarness,
+    node::{BASE_CHAIN_ID, LocalFlashblocksState, LocalNodeProvider},
 };
-use eyre::{eyre, Result};
+use eyre::{Result, eyre};
 use op_alloy_consensus::OpTxEnvelope;
 use reth_optimism_primitives::OpTransactionSigned;
 use reth_transaction_pool::test_utils::TransactionBuilder;
 use tips_core::types::Bundle;
 
 use super::utils::secret_from_hex;
+use crate::rpc::{MeteringApiImpl, MeteringApiServer};
 
 struct RpcTestContext {
-    harness: TestHarness,
+    harness: FlashblocksHarness,
     api: MeteringApiImpl<LocalNodeProvider, LocalFlashblocksState>,
 }
 
 impl RpcTestContext {
     async fn new() -> Result<Self> {
-        let harness = TestHarness::new(default_launcher).await?;
+        let harness = FlashblocksHarness::new().await?;
         let provider = harness.blockchain_provider();
         let flashblocks_state = harness.flashblocks_state();
         let api = MeteringApiImpl::new(provider, flashblocks_state);
@@ -33,7 +33,7 @@ impl RpcTestContext {
         self.harness.accounts()
     }
 
-    fn harness(&self) -> &TestHarness {
+    fn harness(&self) -> &FlashblocksHarness {
         &self.harness
     }
 
@@ -75,7 +75,7 @@ async fn test_meter_bundle_empty() -> Result<()> {
 
     assert_eq!(response.results.len(), 0);
     assert_eq!(response.total_gas_used, 0);
-    assert_eq!(response.gas_fees, "0");
+    assert_eq!(response.gas_fees, U256::ZERO);
 
     let latest_block = ctx.harness().provider().get_block_number().await?;
     assert_eq!(response.state_block_number, latest_block);
@@ -113,19 +113,12 @@ async fn test_meter_bundle_single_transaction() -> Result<()> {
     assert_eq!(response.results.len(), 1);
     assert_eq!(response.total_gas_used, 21_000);
     assert!(response.total_execution_time_us > 0);
-    assert!(
-        response.state_root_time_us > 0,
-        "state_root_time_us should be greater than zero"
-    );
 
     let result = &response.results[0];
     assert_eq!(result.from_address, sender_address);
-    assert_eq!(
-        result.to_address,
-        Some(address!("0x1111111111111111111111111111111111111111"))
-    );
+    assert_eq!(result.to_address, Some(address!("0x1111111111111111111111111111111111111111")));
     assert_eq!(result.gas_used, 21_000);
-    assert_eq!(result.gas_price, "1000000000");
+    assert_eq!(result.gas_price, U256::from(1_000_000_000u64));
     assert!(result.execution_time_us > 0);
 
     Ok(())
@@ -150,10 +143,8 @@ async fn test_meter_bundle_multiple_transactions() -> Result<()> {
         .max_priority_fee_per_gas(1_000_000_000)
         .into_eip1559();
     let tx1_bytes = Bytes::from(
-        OpTxEnvelope::from(OpTransactionSigned::Eip1559(
-            tx1.as_eip1559().unwrap().clone(),
-        ))
-        .encoded_2718(),
+        OpTxEnvelope::from(OpTransactionSigned::Eip1559(tx1.as_eip1559().unwrap().clone()))
+            .encoded_2718(),
     );
 
     let tx2 = TransactionBuilder::default()
@@ -167,10 +158,8 @@ async fn test_meter_bundle_multiple_transactions() -> Result<()> {
         .max_priority_fee_per_gas(2_000_000_000)
         .into_eip1559();
     let tx2_bytes = Bytes::from(
-        OpTxEnvelope::from(OpTransactionSigned::Eip1559(
-            tx2.as_eip1559().unwrap().clone(),
-        ))
-        .encoded_2718(),
+        OpTxEnvelope::from(OpTransactionSigned::Eip1559(tx2.as_eip1559().unwrap().clone()))
+            .encoded_2718(),
     );
 
     let bundle = create_bundle(vec![tx1_bytes, tx2_bytes], 0, None);
@@ -181,11 +170,11 @@ async fn test_meter_bundle_multiple_transactions() -> Result<()> {
 
     let result1 = &response.results[0];
     assert_eq!(result1.from_address, ctx.accounts().alice.address);
-    assert_eq!(result1.gas_price, "1000000000");
+    assert_eq!(result1.gas_price, U256::from(1_000_000_000u64));
 
     let result2 = &response.results[1];
     assert_eq!(result2.from_address, ctx.accounts().bob.address);
-    assert_eq!(result2.gas_price, "2000000000");
+    assert_eq!(result2.gas_price, U256::from(2_000_000_000u64));
 
     Ok(())
 }
@@ -284,10 +273,8 @@ async fn test_meter_bundle_gas_calculations() -> Result<()> {
         .max_priority_fee_per_gas(3_000_000_000)
         .into_eip1559();
     let tx1_bytes = Bytes::from(
-        OpTxEnvelope::from(OpTransactionSigned::Eip1559(
-            tx1.as_eip1559().unwrap().clone(),
-        ))
-        .encoded_2718(),
+        OpTxEnvelope::from(OpTransactionSigned::Eip1559(tx1.as_eip1559().unwrap().clone()))
+            .encoded_2718(),
     );
 
     let tx2 = TransactionBuilder::default()
@@ -301,10 +288,8 @@ async fn test_meter_bundle_gas_calculations() -> Result<()> {
         .max_priority_fee_per_gas(7_000_000_000)
         .into_eip1559();
     let tx2_bytes = Bytes::from(
-        OpTxEnvelope::from(OpTransactionSigned::Eip1559(
-            tx2.as_eip1559().unwrap().clone(),
-        ))
-        .encoded_2718(),
+        OpTxEnvelope::from(OpTransactionSigned::Eip1559(tx2.as_eip1559().unwrap().clone()))
+            .encoded_2718(),
     );
 
     let bundle = create_bundle(vec![tx1_bytes, tx2_bytes], 0, None);
@@ -315,16 +300,16 @@ async fn test_meter_bundle_gas_calculations() -> Result<()> {
     let expected_fees_1 = U256::from(21_000) * U256::from(3_000_000_000u64);
     let expected_fees_2 = U256::from(21_000) * U256::from(7_000_000_000u64);
 
-    assert_eq!(response.results[0].gas_fees, expected_fees_1.to_string());
-    assert_eq!(response.results[0].gas_price, "3000000000");
-    assert_eq!(response.results[1].gas_fees, expected_fees_2.to_string());
-    assert_eq!(response.results[1].gas_price, "7000000000");
+    assert_eq!(response.results[0].gas_fees, expected_fees_1);
+    assert_eq!(response.results[0].gas_price, U256::from(3_000_000_000u64));
+    assert_eq!(response.results[1].gas_fees, expected_fees_2);
+    assert_eq!(response.results[1].gas_price, U256::from(7_000_000_000u64));
 
     let total_fees = expected_fees_1 + expected_fees_2;
-    assert_eq!(response.gas_fees, total_fees.to_string());
-    assert_eq!(response.coinbase_diff, total_fees.to_string());
+    assert_eq!(response.gas_fees, total_fees);
+    assert_eq!(response.coinbase_diff, total_fees);
     assert_eq!(response.total_gas_used, 42_000);
-    assert_eq!(response.bundle_gas_price, "5000000000");
+    assert_eq!(response.bundle_gas_price, U256::from(5_000_000_000u64));
 
     Ok(())
 }

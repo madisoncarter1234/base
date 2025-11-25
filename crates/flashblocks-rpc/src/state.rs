@@ -22,22 +22,23 @@ use reth::{
     chainspec::{ChainSpecProvider, EthChainSpec},
     providers::{BlockReaderIdExt, StateProviderFactory},
     revm::{
-        context::result::ResultAndState,
-        database::StateProviderDatabase,
+        DatabaseCommit, State, context::result::ResultAndState, database::StateProviderDatabase,
         db::CacheDB,
-        DatabaseCommit,
-        State,
     },
 };
-use revm_database::states::bundle_state::BundleRetention;
 use reth_evm::{ConfigureEvm, Evm};
 use reth_optimism_chainspec::OpHardforks;
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
 use reth_optimism_primitives::{DepositReceipt, OpBlock, OpPrimitives};
 use reth_optimism_rpc::OpReceiptBuilder;
 use reth_primitives::RecoveredBlock;
-use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcTransaction};
-use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
+use reth_rpc_convert::transaction::ConvertReceiptInput;
+use revm_database::states::bundle_state::BundleRetention;
+use tokio::sync::{
+    Mutex,
+    broadcast::{self, Sender},
+    mpsc::{self, UnboundedReceiver},
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -380,10 +381,9 @@ where
         // Cache reads across flashblocks, accumulating caches from previous
         // pending blocks if available
         let cache_db = match &prev_pending_blocks {
-            Some(pending_blocks) => CacheDB {
-                cache: pending_blocks.get_db_cache(),
-                db: state_provider_db,
-            },
+            Some(pending_blocks) => {
+                CacheDB { cache: pending_blocks.get_db_cache(), db: state_provider_db }
+            }
             None => CacheDB::new(state_provider_db),
         };
 
@@ -395,10 +395,7 @@ where
                 .with_bundle_update()
                 .with_bundle_prestate(pending_blocks.get_bundle_state())
                 .build(),
-            None => State::builder()
-                .with_database(cache_db)
-                .with_bundle_update()
-                .build(),
+            None => State::builder().with_database(cache_db).with_bundle_update().build(),
         };
 
         let mut state_overrides = match &prev_pending_blocks {

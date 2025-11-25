@@ -1,5 +1,6 @@
+use std::sync::Arc;
+
 use alloy_consensus::{Header, Sealed};
-use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::U256;
 use base_reth_flashblocks_rpc::rpc::{FlashblocksAPI, PendingBlocksAPI};
 use jsonrpsee::{
@@ -10,11 +11,10 @@ use reth::providers::BlockReaderIdExt;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{ChainSpecProvider, StateProviderFactory};
-use std::sync::Arc;
 use tips_core::types::{Bundle, MeterBundleResponse, ParsedBundle};
 use tracing::{error, info};
 
-use crate::{meter_bundle, FlashblockTrieCache};
+use crate::{FlashblockTrieCache, meter_bundle};
 
 /// RPC API for transaction metering
 #[rpc(server, namespace = "base")]
@@ -43,11 +43,7 @@ where
 {
     /// Creates a new instance of MeteringApi
     pub fn new(provider: Provider, flashblocks_state: Arc<FB>) -> Self {
-        Self {
-            provider,
-            flashblocks_state,
-            trie_cache: FlashblockTrieCache::new(),
-        }
+        Self { provider, flashblocks_state, trie_cache: FlashblockTrieCache::new() }
     }
 }
 
@@ -130,10 +126,8 @@ where
         })?;
 
         // Get state provider for the canonical block
-        let state_provider = self
-            .provider
-            .state_by_block_number_or_tag(canonical_block_number)
-            .map_err(|e| {
+        let state_provider =
+            self.provider.state_by_block_number_or_tag(canonical_block_number).map_err(|e| {
                 error!(error = %e, "Failed to get state provider");
                 jsonrpsee::types::ErrorObjectOwned::owned(
                     jsonrpsee::types::ErrorCode::InternalError.code(),
@@ -149,9 +143,7 @@ where
         });
 
         // Get the flashblock index if we have pending flashblocks
-        let state_flashblock_index = pending_blocks
-            .as_ref()
-            .map(|pb| pb.latest_flashblock_index());
+        let state_flashblock_index = pending_blocks.as_ref().map(|pb| pb.latest_flashblock_index());
 
         // Ensure the flashblock trie is cached for reuse across bundle simulations
         let cached_trie = if let Some(ref fb_state) = flashblocks_state {
@@ -202,7 +194,6 @@ where
             num_transactions = result.results.len(),
             total_gas_used = result.total_gas_used,
             total_time_us = result.total_time_us,
-            state_root_time_us = result.state_root_time_us,
             state_block_number = header.number,
             flashblock_index = flashblock_index,
             "Bundle metering completed successfully"
@@ -218,9 +209,7 @@ where
             state_block_number: header.number,
             state_flashblock_index,
             total_gas_used: result.total_gas_used,
-            // TODO: Rename to total_time_us in tips-core.
             total_execution_time_us: result.total_time_us,
-            state_root_time_us: result.state_root_time_us,
         })
     }
 }
