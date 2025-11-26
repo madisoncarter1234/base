@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::utils::init_tracing;
-use crate::{FlashblockInclusion, MeteredTransaction, MeteringCache, StreamsIngest};
+use crate::{FlashblockInclusion, MeteredTransaction, MeteringCache, ResourceAnnotator};
 use alloy_primitives::{B256, U256};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -20,16 +20,16 @@ fn test_transaction(tx_hash: B256, priority: u64) -> MeteredTransaction {
 }
 
 #[tokio::test]
-async fn streams_ingest_updates_cache_on_flashblock() {
+async fn annotator_updates_cache_on_flashblock() {
     init_tracing();
 
     let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
     let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<MeteredTransaction>();
     let (flash_sender, flash_receiver) = mpsc::unbounded_channel::<FlashblockInclusion>();
 
-    let ingest = StreamsIngest::new(cache.clone(), tx_receiver, flash_receiver);
+    let annotator = ResourceAnnotator::new(cache.clone(), tx_receiver, flash_receiver);
 
-    let ingest_handle = tokio::spawn(ingest.run());
+    let handle = tokio::spawn(annotator.run());
 
     // Send a metered transaction (goes to pending map).
     let tx_hash = B256::random();
@@ -69,20 +69,19 @@ async fn streams_ingest_updates_cache_on_flashblock() {
     drop(tx_sender);
     drop(flash_sender);
 
-    // Wait for ingest task to exit cleanly.
-    ingest_handle.await.unwrap();
+    handle.await.unwrap();
 }
 
 #[tokio::test]
-async fn streams_ingest_ignores_unknown_tx_hashes() {
+async fn annotator_ignores_unknown_tx_hashes() {
     init_tracing();
 
     let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
     let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<MeteredTransaction>();
     let (flash_sender, flash_receiver) = mpsc::unbounded_channel::<FlashblockInclusion>();
 
-    let ingest = StreamsIngest::new(cache.clone(), tx_receiver, flash_receiver);
-    let ingest_handle = tokio::spawn(ingest.run());
+    let annotator = ResourceAnnotator::new(cache.clone(), tx_receiver, flash_receiver);
+    let handle = tokio::spawn(annotator.run());
 
     // Send a metered transaction.
     let tx_hash = B256::random();
@@ -125,5 +124,5 @@ async fn streams_ingest_ignores_unknown_tx_hashes() {
     drop(cache_read);
     drop(tx_sender);
     drop(flash_sender);
-    ingest_handle.await.unwrap();
+    handle.await.unwrap();
 }

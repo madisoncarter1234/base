@@ -18,14 +18,14 @@ pub struct FlashblockInclusion {
 /// Maximum number of pending transactions before oldest entries are evicted.
 const MAX_PENDING_TRANSACTIONS: usize = 10_000;
 
-/// Handles ingestion of Kafka metrics and websocket inclusion events, writing into the cache.
+/// Annotates flashblock transactions with their resource usage.
 ///
 /// The flow is:
 /// 1. Kafka sends `MeteredTransaction` with resource usage data keyed by tx hash
 /// 2. These are stored in a pending lookup table
 /// 3. Websocket sends `FlashblockInclusion` with actual (block, flashblock) location
 /// 4. We look up pending transactions and insert them into the cache at the real location
-pub struct StreamsIngest {
+pub struct ResourceAnnotator {
     cache: Arc<RwLock<MeteringCache>>,
     tx_updates_rx: UnboundedReceiver<MeteredTransaction>,
     flashblock_rx: UnboundedReceiver<FlashblockInclusion>,
@@ -34,7 +34,7 @@ pub struct StreamsIngest {
     pending_transactions: indexmap::IndexMap<TxHash, MeteredTransaction>,
 }
 
-impl StreamsIngest {
+impl ResourceAnnotator {
     pub fn new(
         cache: Arc<RwLock<MeteringCache>>,
         tx_updates_rx: UnboundedReceiver<MeteredTransaction>,
@@ -49,7 +49,7 @@ impl StreamsIngest {
     }
 
     pub async fn run(mut self) {
-        info!(target: "metering::streams", "Starting StreamsIngest loop");
+        info!(target: "metering::annotator", "Starting ResourceAnnotator");
         loop {
             tokio::select! {
                 Some(tx_event) = self.tx_updates_rx.recv() => {
@@ -59,7 +59,7 @@ impl StreamsIngest {
                     self.handle_flashblock_event(flashblock_event);
                 }
                 else => {
-                    info!(target: "metering::streams", "StreamsIngest loop terminating");
+                    info!(target: "metering::annotator", "ResourceAnnotator terminating");
                     break;
                 }
             }

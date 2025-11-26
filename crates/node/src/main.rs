@@ -5,7 +5,7 @@ use base_reth_flashblocks_rpc::subscription::{Flashblock, FlashblocksSubscriber}
 use base_reth_metering::{
     DEFAULT_PRIORITY_FEE_PERCENTILE, FlashblockInclusion, KafkaBundleConsumer,
     KafkaBundleConsumerConfig, MeteredTransaction, MeteringApiImpl, MeteringApiServer,
-    MeteringCache, PriorityFeeEstimator, StreamsIngest,
+    MeteringCache, PriorityFeeEstimator, ResourceAnnotator,
 };
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
@@ -242,9 +242,9 @@ fn main() {
                 let (flashblock_sender, flashblock_receiver) =
                     mpsc::unbounded_channel::<FlashblockInclusion>();
 
-                let ingest_cache = cache.clone();
+                let annotator_cache = cache.clone();
                 tokio::spawn(async move {
-                    StreamsIngest::new(ingest_cache, tx_receiver, flashblock_receiver)
+                    ResourceAnnotator::new(annotator_cache, tx_receiver, flashblock_receiver)
                         .run()
                         .await;
                 });
