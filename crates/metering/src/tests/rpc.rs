@@ -4,6 +4,7 @@ use alloy_provider::Provider;
 use base_reth_test_utils::{
     flashblocks_harness::FlashblocksHarness,
     node::{BASE_CHAIN_ID, LocalFlashblocksState, LocalNodeProvider},
+    tracing::init_silenced_tracing,
 };
 use eyre::{Result, eyre};
 use op_alloy_consensus::OpTxEnvelope;
@@ -67,7 +68,7 @@ fn create_bundle(txs: Vec<Bytes>, block_number: u64, min_timestamp: Option<u64>)
 
 #[tokio::test]
 async fn test_meter_bundle_empty() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let bundle = create_bundle(vec![], 0, None);
@@ -85,7 +86,7 @@ async fn test_meter_bundle_empty() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_single_transaction() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let sender_account = &ctx.accounts().alice;
@@ -126,7 +127,7 @@ async fn test_meter_bundle_single_transaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_multiple_transactions() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let secret1 = secret_from_hex(ctx.accounts().alice.private_key);
@@ -181,7 +182,7 @@ async fn test_meter_bundle_multiple_transactions() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_invalid_transaction() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let bundle = create_bundle(vec![Bytes::from_static(b"\xde\xad\xbe\xef")], 0, None);
@@ -193,7 +194,7 @@ async fn test_meter_bundle_invalid_transaction() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_uses_latest_block() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     ctx.harness().advance_chain(2).await?;
@@ -209,7 +210,7 @@ async fn test_meter_bundle_uses_latest_block() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_ignores_bundle_block_number() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let bundle1 = create_bundle(vec![], 0, None);
@@ -227,7 +228,7 @@ async fn test_meter_bundle_ignores_bundle_block_number() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_custom_timestamp() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let custom_timestamp = 1_234_567_890;
@@ -242,7 +243,7 @@ async fn test_meter_bundle_custom_timestamp() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_arbitrary_block_number() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let bundle = create_bundle(vec![], 999_999, None);
@@ -256,7 +257,7 @@ async fn test_meter_bundle_arbitrary_block_number() -> Result<()> {
 
 #[tokio::test]
 async fn test_meter_bundle_gas_calculations() -> Result<()> {
-    reth_tracing::init_test_tracing();
+    init_silenced_tracing();
     let ctx = RpcTestContext::new().await?;
 
     let secret1 = secret_from_hex(ctx.accounts().alice.private_key);
