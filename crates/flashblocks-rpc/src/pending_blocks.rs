@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use alloy_consensus::{Header, Sealed};
 use alloy_eips::BlockNumberOrTag;
@@ -20,7 +20,7 @@ use reth::revm::{
 use reth_rpc_convert::RpcTransaction;
 use reth_rpc_eth_api::{RpcBlock, RpcReceipt};
 
-use crate::{rpc::PendingBlocksAPI, subscription::Flashblock};
+use crate::{metrics::Metrics, rpc::PendingBlocksAPI, subscription::Flashblock};
 
 pub struct PendingBlocksBuilder {
     flashblocks: Vec<Flashblock>,
@@ -208,8 +208,20 @@ impl PendingBlocks {
         self.db_cache.clone()
     }
 
+    /// Returns a clone of the bundle state.
+    ///
+    /// NOTE: This clones the entire BundleState, which contains a HashMap of all touched
+    /// accounts and their storage slots. The cost scales with the number of accounts and
+    /// storage slots modified in the flashblock. Monitor `bundle_state_clone_duration` and
+    /// `bundle_state_clone_size` metrics to track if this becomes a bottleneck.
     pub fn get_bundle_state(&self) -> BundleState {
-        self.bundle_state.clone()
+        let metrics = Metrics::default();
+        let size = self.bundle_state.state.len();
+        let start = Instant::now();
+        let cloned = self.bundle_state.clone();
+        metrics.bundle_state_clone_duration.record(start.elapsed());
+        metrics.bundle_state_clone_size.record(size as f64);
+        cloned
     }
 
     pub fn get_transactions_for_block(&self, block_number: BlockNumber) -> Vec<Transaction> {
