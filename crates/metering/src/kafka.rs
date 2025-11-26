@@ -21,6 +21,9 @@ pub struct KafkaBundleConsumerConfig {
     pub topic: String,
 }
 
+/// Maximum backoff delay for Kafka receive errors.
+const MAX_BACKOFF_SECS: u64 = 60;
+
 /// Consumes `AcceptedBundle` events from Kafka and publishes transaction-level metering data.
 pub struct KafkaBundleConsumer {
     consumer: StreamConsumer,
@@ -56,9 +59,13 @@ impl KafkaBundleConsumer {
             "Starting Kafka bundle consumer"
         );
 
+        let mut backoff_secs = 1u64;
+
         loop {
             match self.consumer.recv().await {
                 Ok(message) => {
+                    // Reset backoff on successful receive.
+                    backoff_secs = 1;
                     if let Err(err) = self.handle_message(message).await {
                         error!(target: "metering::kafka", error = %err, "Failed to process Kafka message");
                         metrics::counter!("metering.kafka.errors_total").increment(1);
@@ -68,11 +75,13 @@ impl KafkaBundleConsumer {
                     error!(
                         target: "metering::kafka",
                         error = %err,
-                        "Kafka receive error for topic {}. Retrying in 1s",
+                        backoff_secs,
+                        "Kafka receive error for topic {}. Retrying after backoff",
                         self.topic
                     );
                     metrics::counter!("metering.kafka.errors_total").increment(1);
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 }
             }
         }
@@ -150,6 +159,8 @@ impl KafkaBundleConsumer {
             let priority_fee_per_gas = calculate_priority_fee(tx);
             let data_availability_bytes = tx_estimated_size_fjord_bytes(&tx.encoded_2718());
 
+            // TODO(metering): Populate state_root_time_us once the TIPS Kafka schema
+            // includes per-transaction state-root timing.
             let metered_tx = MeteredTransaction {
                 tx_hash: tx.tx_hash(),
                 priority_fee_per_gas,

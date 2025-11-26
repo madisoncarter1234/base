@@ -255,7 +255,7 @@ where
                 )
             })?;
 
-        let response = Self::build_priority_fee_response(meter_bundle.clone(), estimates);
+        let response = Self::build_priority_fee_response(meter_bundle, estimates);
         Ok(response)
     }
 }

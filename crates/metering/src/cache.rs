@@ -1,7 +1,6 @@
 use alloy_primitives::B256;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Instant;
 
 use alloy_primitives::U256;
 
@@ -71,8 +70,6 @@ pub struct FlashblockMetrics {
     /// Transactions keyed by hash in insertion order.
     transactions: IndexMap<B256, MeteredTransaction>,
     totals: ResourceTotals,
-    /// Last time this flashblock was updated.
-    updated_at: Instant,
 }
 
 impl FlashblockMetrics {
@@ -82,28 +79,22 @@ impl FlashblockMetrics {
             flashblock_index,
             transactions: IndexMap::new(),
             totals: ResourceTotals::default(),
-            updated_at: Instant::now(),
         }
     }
 
     pub fn upsert_transaction(&mut self, tx: MeteredTransaction) {
         let tx_hash = tx.tx_hash;
-        match self.transactions.get(&tx_hash) {
-            Some(existing) => {
-                self.totals.subtract(existing);
-            }
-            None => {}
+        if let Some(existing) = self.transactions.get(&tx_hash) {
+            self.totals.subtract(existing);
         }
         self.totals.accumulate(&tx);
         self.transactions.insert(tx_hash, tx);
-        self.updated_at = Instant::now();
     }
 
     pub fn remove_transaction(&mut self, tx_hash: &B256) -> Option<MeteredTransaction> {
         let removed = self.transactions.shift_remove(tx_hash);
         if let Some(ref tx) = removed {
             self.totals.subtract(tx);
-            self.updated_at = Instant::now();
         }
         removed
     }
@@ -290,6 +281,10 @@ impl MeteringCache {
 
     pub fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
     }
 
     pub fn blocks_desc(&self) -> impl Iterator<Item = &BlockMetrics> {

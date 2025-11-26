@@ -13,6 +13,16 @@ pub enum ResourceKind {
 }
 
 impl ResourceKind {
+    /// Returns `true` if this resource is "use-it-or-lose-it", meaning capacity
+    /// that isn't consumed in one flashblock cannot be reclaimed in later ones.
+    ///
+    /// Execution time is the canonical example: the block builder has a fixed
+    /// time budget per block, and unused time in flashblock 0 doesn't roll over
+    /// to flashblock 1. For these resources, the estimator aggregates usage
+    /// across all flashblocks rather than evaluating each flashblock in isolation.
+    ///
+    /// Other resources like gas and DA bytes are bounded per-block but are
+    /// evaluated per-flashblock since their limits apply independently.
     fn use_it_or_lose_it(self) -> bool {
         matches!(self, ResourceKind::ExecutionTime)
     }
@@ -81,6 +91,9 @@ impl PriorityFeeEstimator {
 
     /// Returns fee estimates for the provided block. If `block_number` is `None`
     /// the most recent block in the cache is used.
+    ///
+    /// Returns `None` if the cache is empty, the requested block is not cached,
+    /// or no transactions exist in the cached flashblocks.
     pub fn estimate_for_block(
         &self,
         block_number: Option<u64>,
