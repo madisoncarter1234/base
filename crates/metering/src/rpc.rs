@@ -10,14 +10,13 @@ use op_alloy_flz::tx_estimated_size_fjord_bytes;
 use reth::providers::BlockReaderIdExt;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_provider::{ChainSpecProvider, StateProviderFactory};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tips_core::types::{Bundle, MeterBundleResponse, ParsedBundle};
 use tracing::{debug, error, info};
 
 use crate::{
-    BlockPriorityEstimates, PriorityFeeEstimator, ResourceDemand, ResourceEstimate, ResourceKind,
-    meter_bundle,
+    PriorityFeeEstimator, ResourceDemand, ResourceEstimate, ResourceEstimates, ResourceKind,
+    RollingPriorityEstimates, meter_bundle,
 };
 
 /// Default percentile applied when selecting a recommended priority fee among
@@ -36,23 +35,18 @@ pub struct ResourceFeeEstimateResponse {
     pub total_transactions: u64,
 }
 
-/// Priority-fee estimates for a single flashblock index.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FlashblockFeeEstimatesResponse {
-    pub flashblock_index: u64,
-    pub estimates: Vec<ResourceFeeEstimateResponse>,
-}
-
 /// Response payload for `base_meteredPriorityFeePerGas`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeteredPriorityFeeResponse {
     #[serde(flatten)]
     pub meter_bundle: MeterBundleResponse,
-    pub flashblock_estimates: Vec<FlashblockFeeEstimatesResponse>,
-    pub next_block: Vec<ResourceFeeEstimateResponse>,
-    pub next_flashblock: Vec<ResourceFeeEstimateResponse>,
+    /// Single recommended priority fee (max across all resources and median across recent blocks).
+    pub recommended_priority_fee: String,
+    /// Number of recent blocks used to compute the rolling estimate.
+    pub blocks_sampled: u64,
+    /// Per-resource estimates (median across sampled blocks).
+    pub resource_estimates: Vec<ResourceFeeEstimateResponse>,
 }
 
 /// RPC API for transaction metering.
@@ -197,25 +191,15 @@ where
 
     fn build_priority_fee_response(
         meter_bundle: MeterBundleResponse,
-        estimates: BlockPriorityEstimates,
+        estimates: RollingPriorityEstimates,
     ) -> MeteredPriorityFeeResponse {
-        let flashblock_estimates = estimates
-            .flashblocks
-            .into_iter()
-            .map(|flashblock| FlashblockFeeEstimatesResponse {
-                flashblock_index: flashblock.flashblock_index,
-                estimates: ordered_resource_estimates(flashblock.resource_estimates),
-            })
-            .collect();
-
-        let next_block = ordered_resource_estimates(estimates.next_block);
-        let next_flashblock = ordered_resource_estimates(estimates.next_flashblock);
+        let resource_estimates = resource_estimates_to_vec(&estimates.estimates);
 
         MeteredPriorityFeeResponse {
             meter_bundle,
-            flashblock_estimates,
-            next_block,
-            next_flashblock,
+            recommended_priority_fee: estimates.recommended_priority_fee.to_string(),
+            blocks_sampled: estimates.blocks_sampled as u64,
+            resource_estimates,
         }
     }
 }
@@ -246,7 +230,7 @@ where
 
         let estimates = self
             .priority_fee_estimator
-            .estimate_for_block(None, resource_demand)
+            .estimate_rolling(resource_demand)
             .ok_or_else(|| {
                 ErrorObjectOwned::owned(
                     ErrorCode::InternalError.code(),
@@ -260,18 +244,14 @@ where
     }
 }
 
-fn ordered_resource_estimates(
-    estimates: BTreeMap<ResourceKind, ResourceEstimate>,
-) -> Vec<ResourceFeeEstimateResponse> {
-    let mut entries: Vec<_> = estimates.into_iter().collect();
-    entries.sort_by_key(|(kind, _)| *kind);
-    entries
-        .into_iter()
-        .map(|(resource, estimate)| to_response(resource, estimate))
+fn resource_estimates_to_vec(estimates: &ResourceEstimates) -> Vec<ResourceFeeEstimateResponse> {
+    estimates
+        .iter()
+        .map(|(kind, est)| to_response(kind, est))
         .collect()
 }
 
-fn to_response(resource: ResourceKind, estimate: ResourceEstimate) -> ResourceFeeEstimateResponse {
+fn to_response(resource: ResourceKind, estimate: &ResourceEstimate) -> ResourceFeeEstimateResponse {
     ResourceFeeEstimateResponse {
         resource: resource.as_camel_case().to_string(),
         threshold_priority_fee: estimate.threshold_priority_fee.to_string(),

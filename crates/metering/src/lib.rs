@@ -13,7 +13,7 @@ pub use cache::{
 };
 pub use estimator::{
     BlockPriorityEstimates, FlashblockResourceEstimates, PriorityFeeEstimator, ResourceDemand,
-    ResourceEstimate, ResourceKind,
+    ResourceEstimate, ResourceEstimates, ResourceKind, RollingPriorityEstimates,
 };
 pub use kafka::{KafkaBundleConsumer, KafkaBundleConsumerConfig};
 pub use meter::meter_bundle;
