@@ -3,9 +3,9 @@ use base_reth_flashblocks_rpc::rpc::{EthApiExt, EthApiOverrideServer};
 use base_reth_flashblocks_rpc::state::FlashblocksState;
 use base_reth_flashblocks_rpc::subscription::{Flashblock, FlashblocksSubscriber};
 use base_reth_metering::{
-    DEFAULT_PRIORITY_FEE_PERCENTILE, FlashblockInclusion, FlashblockSnapshot, KafkaBundleConsumer,
-    KafkaBundleConsumerConfig, MeteringApiImpl, MeteringApiServer, MeteringCache,
-    PriorityFeeEstimator, StreamsIngest, TxMeteringEvent,
+    DEFAULT_PRIORITY_FEE_PERCENTILE, FlashblockInclusion, KafkaBundleConsumer,
+    KafkaBundleConsumerConfig, MeteredTransaction, MeteringApiImpl, MeteringApiServer,
+    MeteringCache, PriorityFeeEstimator, StreamsIngest,
 };
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
@@ -117,7 +117,7 @@ struct MeteringKafkaSettings {
 struct MeteringRuntime {
     cache: Arc<RwLock<MeteringCache>>,
     estimator: Arc<PriorityFeeEstimator>,
-    tx_sender: mpsc::UnboundedSender<TxMeteringEvent>,
+    tx_sender: mpsc::UnboundedSender<MeteredTransaction>,
     flashblock_sender: mpsc::UnboundedSender<FlashblockInclusion>,
 }
 
@@ -238,22 +238,13 @@ fn main() {
                     DEFAULT_PRIORITY_FEE_PERCENTILE,
                 ));
 
-                let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<TxMeteringEvent>();
+                let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<MeteredTransaction>();
                 let (flashblock_sender, flashblock_receiver) =
                     mpsc::unbounded_channel::<FlashblockInclusion>();
-                let (snapshot_sender, mut snapshot_receiver) =
-                    mpsc::unbounded_channel::<FlashblockSnapshot>();
-
-                // Drain snapshot channel until downstream consumers are attached.
-                tokio::spawn(async move {
-                    while snapshot_receiver.recv().await.is_some() {
-                        metrics::counter!("metering.snapshots.dropped").increment(1);
-                    }
-                });
 
                 let ingest_cache = cache.clone();
                 tokio::spawn(async move {
-                    StreamsIngest::new(ingest_cache, tx_receiver, flashblock_receiver, snapshot_sender)
+                    StreamsIngest::new(ingest_cache, tx_receiver, flashblock_receiver)
                         .run()
                         .await;
                 });

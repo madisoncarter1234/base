@@ -19,5 +19,5 @@ pub use meter::meter_bundle;
 pub use rpc::{
     DEFAULT_PRIORITY_FEE_PERCENTILE, MeteredPriorityFeeResponse, MeteringApiImpl, MeteringApiServer,
 };
-pub use streams::{FlashblockInclusion, FlashblockSnapshot, StreamsIngest, TxMeteringEvent};
+pub use streams::{FlashblockInclusion, StreamsIngest};
 pub use tips_core::types::{Bundle, MeterBundleResponse, TransactionResult};

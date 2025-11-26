@@ -1,55 +1,50 @@
 use crate::{MeteredTransaction, MeteringCache};
 use alloy_primitives::TxHash;
 use parking_lot::RwLock;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, info, warn};
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::{debug, info, warn};
 
-/// Message emitted by the Kafka ingest task once a transaction has been processed.
-#[derive(Debug)]
-pub struct TxMeteringEvent {
-    pub block_number: u64,
-    pub flashblock_index: u64,
-    pub transaction: MeteredTransaction,
-}
-
-/// Message received from the flashblocks websocket feed.
+/// Message received from the flashblocks websocket feed indicating which
+/// transactions were included in a specific flashblock.
 #[derive(Debug)]
 pub struct FlashblockInclusion {
     pub block_number: u64,
     pub flashblock_index: u64,
-    /// Tx hashes included in this flashblock in priority-fee order.
+    /// Tx hashes included in this flashblock.
     pub ordered_tx_hashes: Vec<TxHash>,
 }
 
-/// Output sent to downstream components when a flashblock snapshot is ready.
-#[derive(Debug)]
-pub struct FlashblockSnapshot {
-    pub block_number: u64,
-    pub flashblock_index: u64,
-    pub transactions: Vec<MeteredTransaction>,
-}
+/// Maximum number of pending transactions before oldest entries are evicted.
+const MAX_PENDING_TRANSACTIONS: usize = 10_000;
 
 /// Handles ingestion of Kafka metrics and websocket inclusion events, writing into the cache.
+///
+/// The flow is:
+/// 1. Kafka sends `MeteredTransaction` with resource usage data keyed by tx hash
+/// 2. These are stored in a pending lookup table
+/// 3. Websocket sends `FlashblockInclusion` with actual (block, flashblock) location
+/// 4. We look up pending transactions and insert them into the cache at the real location
 pub struct StreamsIngest {
     cache: Arc<RwLock<MeteringCache>>,
-    tx_updates_rx: UnboundedReceiver<TxMeteringEvent>,
+    tx_updates_rx: UnboundedReceiver<MeteredTransaction>,
     flashblock_rx: UnboundedReceiver<FlashblockInclusion>,
-    snapshot_tx: UnboundedSender<FlashblockSnapshot>,
+    /// Pending metering data awaiting flashblock inclusion confirmation.
+    /// Uses IndexMap to maintain insertion order for FIFO eviction.
+    pending_transactions: indexmap::IndexMap<TxHash, MeteredTransaction>,
 }
 
 impl StreamsIngest {
     pub fn new(
         cache: Arc<RwLock<MeteringCache>>,
-        tx_updates_rx: UnboundedReceiver<TxMeteringEvent>,
+        tx_updates_rx: UnboundedReceiver<MeteredTransaction>,
         flashblock_rx: UnboundedReceiver<FlashblockInclusion>,
-        snapshot_tx: UnboundedSender<FlashblockSnapshot>,
     ) -> Self {
         Self {
             cache,
             tx_updates_rx,
             flashblock_rx,
-            snapshot_tx,
+            pending_transactions: indexmap::IndexMap::new(),
         }
     }
 
@@ -71,71 +66,70 @@ impl StreamsIngest {
         }
     }
 
-    fn handle_tx_event(&mut self, event: TxMeteringEvent) {
+    fn handle_tx_event(&mut self, tx: MeteredTransaction) {
         debug!(
-            block_number = event.block_number,
-            flashblock_index = event.flashblock_index,
-            tx_hash = %event.transaction.tx_hash,
-            "Inserting metered transaction into cache"
+            tx_hash = %tx.tx_hash,
+            gas_used = tx.gas_used,
+            "Storing metered transaction in pending map"
         );
-        let mut cache = self.cache.write();
-        cache.upsert_transaction(
-            event.block_number,
-            event.flashblock_index,
-            event.transaction,
-        );
-        let block_count = cache.len();
-        metrics::gauge!("metering.cache.window_depth").set(block_count as f64);
-        metrics::counter!("metering.cache.tx_events_total").increment(1);
+        self.pending_transactions.insert(tx.tx_hash, tx);
+
+        // Evict oldest entries if we exceed the limit.
+        while self.pending_transactions.len() > MAX_PENDING_TRANSACTIONS {
+            if let Some((evicted_hash, _)) = self.pending_transactions.shift_remove_index(0) {
+                info!(
+                    tx_hash = %evicted_hash,
+                    "Evicting old transaction from pending map (limit exceeded)"
+                );
+                metrics::counter!("metering.pending.evicted").increment(1);
+            }
+        }
+
+        metrics::gauge!("metering.pending.size").set(self.pending_transactions.len() as f64);
+        metrics::counter!("metering.kafka.tx_events_total").increment(1);
     }
 
     fn handle_flashblock_event(&mut self, event: FlashblockInclusion) {
         metrics::counter!("metering.streams.flashblocks_total").increment(1);
-        let transactions = {
-            let cache = self.cache.read();
-            if let Some(flashblock) = cache.flashblock(event.block_number, event.flashblock_index) {
-                let mut tx_by_hash: HashMap<_, _> = flashblock
-                    .transactions()
-                    .map(|tx| (tx.tx_hash, tx.clone()))
-                    .collect();
-                event
-                    .ordered_tx_hashes
-                    .iter()
-                    .filter_map(|hash| tx_by_hash.remove(hash))
-                    .collect::<Vec<_>>()
-            } else {
-                warn!(
-                    block_number = event.block_number,
-                    flashblock_index = event.flashblock_index,
-                    "Flashblock inclusion arrived before transactions were cached"
-                );
-                metrics::counter!("metering.streams.misses_total").increment(1);
-                return;
-            }
-        };
 
-        if transactions.is_empty() {
+        let mut matched = 0usize;
+        let mut missed = 0usize;
+
+        {
+            let mut cache = self.cache.write();
+            for tx_hash in &event.ordered_tx_hashes {
+                if let Some(tx) = self.pending_transactions.shift_remove(tx_hash) {
+                    cache.upsert_transaction(event.block_number, event.flashblock_index, tx);
+                    matched += 1;
+                } else {
+                    missed += 1;
+                }
+            }
+        }
+
+        if matched > 0 {
+            debug!(
+                block_number = event.block_number,
+                flashblock_index = event.flashblock_index,
+                matched,
+                "Inserted transactions into cache from flashblock"
+            );
+        }
+
+        // All transactions should come through as bundles. Any misses indicate
+        // the Kafka event hasn't arrived yet or was lost.
+        if missed > 0 {
             warn!(
                 block_number = event.block_number,
                 flashblock_index = event.flashblock_index,
-                "Received flashblock inclusion with no matching cached transactions"
+                matched,
+                missed,
+                "Flashblock contained transactions not found in pending map"
             );
-            metrics::counter!("metering.streams.misses_total").increment(1);
-            return;
+            metrics::counter!("metering.streams.tx_misses_total").increment(missed as u64);
         }
 
-        metrics::gauge!("metering.streams.transactions_in_flashblock")
-            .set(transactions.len() as f64);
-
-        let snapshot = FlashblockSnapshot {
-            block_number: event.block_number,
-            flashblock_index: event.flashblock_index,
-            transactions,
-        };
-
-        if let Err(e) = self.snapshot_tx.send(snapshot) {
-            error!(error = %e, "Failed to send flashblock snapshot");
-            metrics::counter!("metering.streams.snapshot_errors").increment(1);
-        }
+        metrics::gauge!("metering.pending.size").set(self.pending_transactions.len() as f64);
+        metrics::counter!("metering.streams.tx_matched_total").increment(matched as u64);
     }
 }

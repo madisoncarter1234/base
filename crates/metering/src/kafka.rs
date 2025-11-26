@@ -1,4 +1,4 @@
-use crate::{MeteredTransaction, TxMeteringEvent};
+use crate::MeteredTransaction;
 use alloy_consensus::Transaction;
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::Encodable2718;
@@ -27,14 +27,14 @@ const MAX_BACKOFF_SECS: u64 = 60;
 /// Consumes `AcceptedBundle` events from Kafka and publishes transaction-level metering data.
 pub struct KafkaBundleConsumer {
     consumer: StreamConsumer,
-    tx_sender: UnboundedSender<TxMeteringEvent>,
+    tx_sender: UnboundedSender<MeteredTransaction>,
     topic: String,
 }
 
 impl KafkaBundleConsumer {
     pub fn new(
         config: KafkaBundleConsumerConfig,
-        tx_sender: UnboundedSender<TxMeteringEvent>,
+        tx_sender: UnboundedSender<MeteredTransaction>,
     ) -> Result<Self> {
         let KafkaBundleConsumerConfig {
             client_config,
@@ -101,26 +101,15 @@ impl KafkaBundleConsumer {
             metrics::gauge!("metering.kafka.lag_ms").set(lag_ms as f64);
         }
 
-        metrics::gauge!("metering.cache.latest_block").set(bundle.block_number as f64);
         debug!(
             target: "metering::kafka",
             block_number = bundle.block_number,
             uuid = %bundle.uuid(),
+            tx_count = bundle.txs.len(),
             "Received accepted bundle from Kafka"
         );
 
-        if let Some(flashblock_index) = bundle.meter_bundle_response.state_flashblock_index {
-            self.publish_transactions(&bundle, flashblock_index)?;
-            metrics::gauge!("metering.cache.latest_flashblock_index").set(flashblock_index as f64);
-        } else {
-            warn!(
-                target: "metering::kafka",
-                block_number = bundle.block_number,
-                uuid = %bundle.uuid(),
-                "Skipping bundle without flashblock index"
-            );
-            metrics::counter!("metering.kafka.messages_skipped").increment(1);
-        }
+        self.publish_transactions(&bundle)?;
 
         // Best-effort asynchronous commit.
         if let Err(err) = self.consumer.commit_message(&message, CommitMode::Async) {
@@ -135,7 +124,7 @@ impl KafkaBundleConsumer {
         Ok(())
     }
 
-    fn publish_transactions(&self, bundle: &AcceptedBundle, flashblock_index: u64) -> Result<()> {
+    fn publish_transactions(&self, bundle: &AcceptedBundle) -> Result<()> {
         if bundle.txs.len() != bundle.meter_bundle_response.results.len() {
             warn!(
                 target: "metering::kafka",
@@ -147,9 +136,6 @@ impl KafkaBundleConsumer {
             metrics::counter!("metering.kafka.messages_skipped").increment(1);
             return Ok(());
         }
-
-        // TODO: replace with real cache depth once Kafka consumer can access shared state.
-        metrics::gauge!("metering.cache.window_depth").set(0.0);
 
         for (tx, result) in bundle
             .txs
@@ -170,16 +156,11 @@ impl KafkaBundleConsumer {
                 data_availability_bytes,
             };
 
-            let event = TxMeteringEvent {
-                block_number: bundle.block_number,
-                flashblock_index,
-                transaction: metered_tx,
-            };
-
-            if let Err(err) = self.tx_sender.send(event) {
+            if let Err(err) = self.tx_sender.send(metered_tx) {
                 warn!(
                     target: "metering::kafka",
                     error = %err,
+                    tx_hash = %tx.tx_hash(),
                     "Failed to send metered transaction event"
                 );
                 metrics::counter!("metering.kafka.errors_total").increment(1);
@@ -188,8 +169,7 @@ impl KafkaBundleConsumer {
 
         trace!(
             target: "metering::kafka",
-            block_number = bundle.block_number,
-            flashblock_index,
+            bundle_uuid = %bundle.uuid(),
             transactions = bundle.txs.len(),
             "Published metering events for bundle"
         );
