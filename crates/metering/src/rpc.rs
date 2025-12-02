@@ -13,9 +13,7 @@ use reth_provider::{BlockReader, ChainSpecProvider, StateProviderFactory};
 use tips_core::types::{Bundle, MeterBundleResponse, ParsedBundle};
 use tracing::{error, info};
 
-use crate::block::meter_block;
-use crate::bundle::meter_bundle;
-use crate::types::MeterBlockResponse;
+use crate::{block::meter_block, bundle::meter_bundle, types::MeterBlockResponse};
 
 /// RPC API for transaction metering
 #[rpc(server, namespace = "base")]
@@ -48,7 +46,10 @@ pub trait MeteringApi {
     /// - `totalTimeUs`: Sum of execution and state root calculation time
     /// - `meteredTransactions`: Per-transaction execution times and gas usage
     #[method(name = "meterBlockByNumber")]
-    async fn meter_block_by_number(&self, number: BlockNumberOrTag) -> RpcResult<MeterBlockResponse>;
+    async fn meter_block_by_number(
+        &self,
+        number: BlockNumberOrTag,
+    ) -> RpcResult<MeterBlockResponse>;
 }
 
 /// Implementation of the metering RPC API
@@ -207,7 +208,10 @@ where
         Ok(response)
     }
 
-    async fn meter_block_by_number(&self, number: BlockNumberOrTag) -> RpcResult<MeterBlockResponse> {
+    async fn meter_block_by_number(
+        &self,
+        number: BlockNumberOrTag,
+    ) -> RpcResult<MeterBlockResponse> {
         info!(block_number = ?number, "Starting block metering by number");
 
         let block = self
@@ -289,19 +293,14 @@ where
         })?;
 
         // Meter the block
-        meter_block(
-            state_provider,
-            self.provider.chain_spec().clone(),
-            block,
-            &parent_header,
-        )
-        .map_err(|e| {
-            error!(error = %e, "Block metering failed");
-            jsonrpsee::types::ErrorObjectOwned::owned(
-                jsonrpsee::types::ErrorCode::InternalError.code(),
-                format!("Block metering failed: {}", e),
-                None::<()>,
-            )
-        })
+        meter_block(state_provider, self.provider.chain_spec().clone(), block, &parent_header)
+            .map_err(|e| {
+                error!(error = %e, "Block metering failed");
+                jsonrpsee::types::ErrorObjectOwned::owned(
+                    jsonrpsee::types::ErrorCode::InternalError.code(),
+                    format!("Block metering failed: {}", e),
+                    None::<()>,
+                )
+            })
     }
 }

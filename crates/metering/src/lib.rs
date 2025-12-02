@@ -1,9 +1,9 @@
 mod block;
 mod bundle;
 mod rpc;
-mod types;
 #[cfg(test)]
 mod tests;
+mod types;
 
 pub use block::meter_block;
 pub use bundle::meter_bundle;
