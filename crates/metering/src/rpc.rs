@@ -228,11 +228,7 @@ where
             .priority_fee_estimator
             .estimate_rolling(resource_demand)
             .map_err(|e| {
-                ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    e.to_string(),
-                    None::<()>,
-                )
+                ErrorObjectOwned::owned(ErrorCode::InvalidParams.code(), e.to_string(), None::<()>)
             })?
             .ok_or_else(|| {
                 ErrorObjectOwned::owned(

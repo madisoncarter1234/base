@@ -4,9 +4,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use alloy_primitives::U256;
 
-/// Maximum number of flashblocks we expect per block.
-const DEFAULT_FLASHBLOCKS_PER_BLOCK: usize = 10;
-
 #[derive(Debug, Clone)]
 pub struct MeteredTransaction {
     pub tx_hash: B256,
@@ -191,7 +188,6 @@ pub struct MeteringCache {
     max_blocks: usize,
     blocks: VecDeque<BlockMetrics>,
     block_index: HashMap<u64, usize>,
-    default_flashblocks_per_block: usize,
 }
 
 impl MeteringCache {
@@ -201,16 +197,11 @@ impl MeteringCache {
             max_blocks,
             blocks: VecDeque::new(),
             block_index: HashMap::new(),
-            default_flashblocks_per_block: DEFAULT_FLASHBLOCKS_PER_BLOCK,
         }
     }
 
     pub fn max_blocks(&self) -> usize {
         self.max_blocks
-    }
-
-    pub fn set_default_flashblocks_per_block(&mut self, cap: usize) {
-        self.default_flashblocks_per_block = cap;
     }
 
     pub fn block(&self, block_number: u64) -> Option<&BlockMetrics> {
@@ -250,19 +241,9 @@ impl MeteringCache {
         flashblock_index: u64,
         tx: MeteredTransaction,
     ) {
-        let flashblock_cap = self.default_flashblocks_per_block;
         let block = self.block_mut(block_number);
-        let (flashblock, is_new_flashblock) = block.flashblock_mut(flashblock_index);
+        let (flashblock, _) = block.flashblock_mut(flashblock_index);
         flashblock.upsert_transaction(tx);
-        if is_new_flashblock && block.flashblock_count() > flashblock_cap {
-            tracing::warn!(
-                target: "metering::cache",
-                block_number,
-                flashblock_index,
-                count = block.flashblock_count(),
-                "Block exceeded expected flashblock count"
-            );
-        }
         block.recompute_totals();
     }
 

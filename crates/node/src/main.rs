@@ -24,6 +24,9 @@ const DEFAULT_DA_BYTES: u64 = 120_000;
 /// Default priority fee returned when a resource is not congested (1 wei).
 const DEFAULT_UNCONGESTED_PRIORITY_FEE: u64 = 1;
 
+/// Default number of recent blocks retained in the metering cache.
+const DEFAULT_METERING_CACHE_SIZE: usize = 12;
+
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
 use eyre::bail;
@@ -117,6 +120,14 @@ struct Args {
     /// Priority fee (in wei) returned when a resource is not congested.
     #[arg(long = "metering-uncongested-priority-fee", default_value_t = DEFAULT_UNCONGESTED_PRIORITY_FEE)]
     pub metering_uncongested_priority_fee: u64,
+
+    /// Number of recent blocks to retain in the metering cache.
+    #[arg(
+        long = "metering-cache-size",
+        default_value_t = DEFAULT_METERING_CACHE_SIZE,
+        value_parser = clap::value_parser!(usize).range(1..)
+    )]
+    pub metering_cache_size: usize,
 }
 
 impl Args {
@@ -270,7 +281,7 @@ fn main() {
             let op_node = OpNode::new(args.rollup_args.clone());
 
             let metering_runtime = if metering_enabled {
-                let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+                let cache = Arc::new(RwLock::new(MeteringCache::new(args.metering_cache_size)));
                 let limits = ResourceLimits {
                     gas_used: Some(args.metering_gas_limit),
                     execution_time_us: Some(args.metering_execution_time_us),
