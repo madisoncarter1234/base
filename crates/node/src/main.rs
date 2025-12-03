@@ -3,10 +3,27 @@ use base_reth_flashblocks_rpc::rpc::{EthApiExt, EthApiOverrideServer};
 use base_reth_flashblocks_rpc::state::FlashblocksState;
 use base_reth_flashblocks_rpc::subscription::{Flashblock, FlashblocksSubscriber};
 use base_reth_metering::{
-    DEFAULT_PRIORITY_FEE_PERCENTILE, FlashblockInclusion, KafkaBundleConsumer,
-    KafkaBundleConsumerConfig, MeteredTransaction, MeteringApiImpl, MeteringApiServer,
-    MeteringCache, PriorityFeeEstimator, ResourceAnnotator,
+    FlashblockInclusion, KafkaBundleConsumer, KafkaBundleConsumerConfig, MeteredTransaction,
+    MeteringApiImpl, MeteringApiServer, MeteringCache, PriorityFeeEstimator, ResourceAnnotator,
+    ResourceLimits,
 };
+
+/// Default percentile applied when selecting a recommended priority fee among
+/// transactions already scheduled above the inclusion threshold.
+const DEFAULT_PRIORITY_FEE_PERCENTILE: f64 = 0.5;
+
+/// Default gas limit per flashblock (30M gas).
+const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
+
+/// Default execution time budget per block in microseconds (50ms).
+const DEFAULT_EXECUTION_TIME_US: u128 = 50_000;
+
+/// Default data availability limit per flashblock in bytes (120KB).
+const DEFAULT_DA_BYTES: u64 = 120_000;
+
+/// Default priority fee returned when a resource is not congested (1 wei).
+const DEFAULT_UNCONGESTED_PRIORITY_FEE: u64 = 1;
+
 use base_reth_transaction_tracing::transaction_tracing_exex;
 use clap::Parser;
 use eyre::bail;
@@ -37,7 +54,7 @@ pub const NODE_RETH_CLIENT_VERSION: &str = concat!("base/v", env!("CARGO_PKG_VER
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+#[derive(Debug, Clone, PartialEq, clap::Args)]
 #[command(next_help_heading = "Rollup")]
 struct Args {
     #[command(flatten)]
@@ -79,6 +96,27 @@ struct Args {
     /// Optional Kafka properties file (key=value per line) merged into the consumer config.
     #[arg(long = "metering-kafka-properties-file")]
     pub metering_kafka_properties_file: Option<String>,
+
+    /// Gas limit per flashblock used for priority fee estimation.
+    #[arg(long = "metering-gas-limit", default_value_t = DEFAULT_GAS_LIMIT)]
+    pub metering_gas_limit: u64,
+
+    /// Execution time budget per block in microseconds for priority fee estimation.
+    #[arg(long = "metering-execution-time-us", default_value_t = DEFAULT_EXECUTION_TIME_US)]
+    pub metering_execution_time_us: u128,
+
+    /// Data availability limit per flashblock in bytes for priority fee estimation.
+    #[arg(long = "metering-da-bytes", default_value_t = DEFAULT_DA_BYTES)]
+    pub metering_da_bytes: u64,
+
+    /// Percentile (0.0-1.0) for selecting recommended priority fee among transactions
+    /// above the inclusion threshold.
+    #[arg(long = "metering-priority-fee-percentile", default_value_t = DEFAULT_PRIORITY_FEE_PERCENTILE)]
+    pub metering_priority_fee_percentile: f64,
+
+    /// Priority fee (in wei) returned when a resource is not congested.
+    #[arg(long = "metering-uncongested-priority-fee", default_value_t = DEFAULT_UNCONGESTED_PRIORITY_FEE)]
+    pub metering_uncongested_priority_fee: u64,
 }
 
 impl Args {
@@ -233,9 +271,17 @@ fn main() {
 
             let metering_runtime = if metering_enabled {
                 let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+                let limits = ResourceLimits {
+                    gas_used: Some(args.metering_gas_limit),
+                    execution_time_us: Some(args.metering_execution_time_us),
+                    state_root_time_us: None,
+                    data_availability_bytes: Some(args.metering_da_bytes),
+                };
                 let estimator = Arc::new(PriorityFeeEstimator::new(
                     cache.clone(),
-                    DEFAULT_PRIORITY_FEE_PERCENTILE,
+                    args.metering_priority_fee_percentile,
+                    limits,
+                    alloy_primitives::U256::from(args.metering_uncongested_priority_fee),
                 ));
 
                 let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<MeteredTransaction>();

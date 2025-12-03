@@ -19,10 +19,6 @@ use crate::{
     RollingPriorityEstimates, meter_bundle,
 };
 
-/// Default percentile applied when selecting a recommended priority fee among
-/// transactions already scheduled above the inclusion threshold.
-pub const DEFAULT_PRIORITY_FEE_PERCENTILE: f64 = 0.5;
-
 /// Human-friendly representation of a resource fee quote.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +227,13 @@ where
         let estimates = self
             .priority_fee_estimator
             .estimate_rolling(resource_demand)
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    ErrorCode::InvalidParams.code(),
+                    e.to_string(),
+                    None::<()>,
+                )
+            })?
             .ok_or_else(|| {
                 ErrorObjectOwned::owned(
                     ErrorCode::InternalError.code(),

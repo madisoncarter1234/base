@@ -3,6 +3,64 @@ use alloy_primitives::U256;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+/// Errors that can occur during priority fee estimation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EstimateError {
+    /// The bundle's resource demand exceeds the configured capacity limit.
+    DemandExceedsCapacity {
+        resource: ResourceKind,
+        demand: u128,
+        limit: u128,
+    },
+}
+
+impl std::fmt::Display for EstimateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EstimateError::DemandExceedsCapacity {
+                resource,
+                demand,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "bundle {} demand ({}) exceeds capacity limit ({})",
+                    resource.as_name(),
+                    demand,
+                    limit
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EstimateError {}
+
+/// Configured capacity limits for each resource type.
+///
+/// These values define the maximum capacity available per flashblock (or per block
+/// for "use-it-or-lose-it" resources). The estimator uses these limits to determine
+/// when resources are congested.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceLimits {
+    pub gas_used: Option<u64>,
+    pub execution_time_us: Option<u128>,
+    pub state_root_time_us: Option<u128>,
+    pub data_availability_bytes: Option<u64>,
+}
+
+impl ResourceLimits {
+    /// Returns the limit for the given resource kind.
+    fn limit_for(&self, resource: ResourceKind) -> Option<u128> {
+        match resource {
+            ResourceKind::GasUsed => self.gas_used.map(|v| v as u128),
+            ResourceKind::ExecutionTime => self.execution_time_us,
+            ResourceKind::StateRootTime => self.state_root_time_us,
+            ResourceKind::DataAvailability => self.data_availability_bytes.map(|v| v as u128),
+        }
+    }
+}
+
 /// Resources that influence flashblock inclusion ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceKind {
@@ -35,6 +93,16 @@ impl ResourceKind {
     /// evaluated per-flashblock since their limits apply independently.
     fn use_it_or_lose_it(self) -> bool {
         matches!(self, ResourceKind::ExecutionTime)
+    }
+
+    /// Returns a human-readable name for the resource kind.
+    pub fn as_name(&self) -> &'static str {
+        match self {
+            ResourceKind::GasUsed => "gas",
+            ResourceKind::ExecutionTime => "execution time",
+            ResourceKind::StateRootTime => "state root time",
+            ResourceKind::DataAvailability => "data availability",
+        }
     }
 }
 
@@ -161,31 +229,53 @@ pub struct RollingPriorityEstimates {
 pub struct PriorityFeeEstimator {
     cache: Arc<RwLock<MeteringCache>>,
     percentile: f64,
+    limits: ResourceLimits,
+    default_priority_fee: U256,
 }
 
 impl PriorityFeeEstimator {
-    /// Creates a new estimator referencing the shared metering cache. `percentile`
-    /// determines which point of the fee distribution (among transactions already
-    /// scheduled above the threshold) is returned as the recommendation.
-    pub fn new(cache: Arc<RwLock<MeteringCache>>, percentile: f64) -> Self {
-        Self { cache, percentile }
+    /// Creates a new estimator referencing the shared metering cache.
+    ///
+    /// # Parameters
+    /// - `cache`: Shared cache containing recent flashblock metering data.
+    /// - `percentile`: Point in the fee distribution (among transactions above threshold)
+    ///   to use for the recommended fee.
+    /// - `limits`: Configured resource capacity limits.
+    /// - `default_priority_fee`: Fee to return when a resource is not congested.
+    pub fn new(
+        cache: Arc<RwLock<MeteringCache>>,
+        percentile: f64,
+        limits: ResourceLimits,
+        default_priority_fee: U256,
+    ) -> Self {
+        Self {
+            cache,
+            percentile,
+            limits,
+            default_priority_fee,
+        }
     }
 
     /// Returns fee estimates for the provided block. If `block_number` is `None`
     /// the most recent block in the cache is used.
     ///
-    /// Returns `None` if the cache is empty, the requested block is not cached,
+    /// Returns `Ok(None)` if the cache is empty, the requested block is not cached,
     /// or no transactions exist in the cached flashblocks.
+    ///
+    /// Returns `Err` if the bundle's demand exceeds any resource's capacity limit.
     pub fn estimate_for_block(
         &self,
         block_number: Option<u64>,
         demand: ResourceDemand,
-    ) -> Option<BlockPriorityEstimates> {
+    ) -> Result<Option<BlockPriorityEstimates>, EstimateError> {
         let cache_guard = self.cache.read();
         let block_metrics = match block_number {
             Some(target) => cache_guard.block(target),
             None => cache_guard.blocks_desc().next(),
-        }?;
+        };
+        let Some(block_metrics) = block_metrics else {
+            return Ok(None);
+        };
 
         let block_number = block_metrics.block_number;
 
@@ -206,7 +296,7 @@ impl PriorityFeeEstimator {
         drop(cache_guard);
 
         if flashblock_transactions.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Flatten into a single list for use-it-or-lose-it resources.
@@ -224,26 +314,26 @@ impl PriorityFeeEstimator {
                 let Some(demand_value) = demand.demand_for(resource) else {
                     continue;
                 };
-
-                let estimate = if resource.use_it_or_lose_it() {
-                    compute_resource_estimate(
-                        &aggregate_transactions,
-                        demand_value,
-                        usage_extractor(resource),
-                        self.percentile,
-                    )
-                } else {
-                    compute_resource_estimate(
-                        &txs,
-                        demand_value,
-                        usage_extractor(resource),
-                        self.percentile,
-                    )
+                let Some(limit_value) = self.limits.limit_for(resource) else {
+                    continue;
                 };
 
-                if let Some(est) = estimate {
-                    estimates.set(resource, est);
-                }
+                let transactions = if resource.use_it_or_lose_it() {
+                    &aggregate_transactions
+                } else {
+                    &txs
+                };
+                let estimate = compute_estimate(
+                    resource,
+                    transactions,
+                    demand_value,
+                    limit_value,
+                    usage_extractor(resource),
+                    self.percentile,
+                    self.default_priority_fee,
+                )?;
+
+                estimates.set(resource, estimate);
             }
 
             flashblock_estimates.push(FlashblockResourceEstimates {
@@ -255,12 +345,12 @@ impl PriorityFeeEstimator {
         let (min_across_flashblocks, max_across_flashblocks) =
             compute_min_max_estimates(&flashblock_estimates);
 
-        Some(BlockPriorityEstimates {
+        Ok(Some(BlockPriorityEstimates {
             block_number,
             flashblocks: flashblock_estimates,
             min_across_flashblocks,
             max_across_flashblocks,
-        })
+        }))
     }
 
     /// Returns rolling fee estimates aggregated across the most recent blocks in the cache.
@@ -268,28 +358,31 @@ impl PriorityFeeEstimator {
     /// For each resource, computes estimates per-block and takes the median recommended fee.
     /// The final `recommended_priority_fee` is the maximum across all resources.
     ///
-    /// Returns `None` if the cache is empty or no blocks contain transaction data.
-    pub fn estimate_rolling(&self, demand: ResourceDemand) -> Option<RollingPriorityEstimates> {
+    /// Returns `Ok(None)` if the cache is empty or no blocks contain transaction data.
+    ///
+    /// Returns `Err` if the bundle's demand exceeds any resource's capacity limit.
+    pub fn estimate_rolling(
+        &self,
+        demand: ResourceDemand,
+    ) -> Result<Option<RollingPriorityEstimates>, EstimateError> {
         let cache_guard = self.cache.read();
-        let block_numbers: Vec<u64> = cache_guard
-            .blocks_desc()
-            .map(|b| b.block_number)
-            .collect();
+        let block_numbers: Vec<u64> = cache_guard.blocks_desc().map(|b| b.block_number).collect();
         drop(cache_guard);
 
         if block_numbers.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        // Collect per-block max estimates.
-        let block_estimates: Vec<ResourceEstimates> = block_numbers
-            .iter()
-            .filter_map(|&n| self.estimate_for_block(Some(n), demand))
-            .map(|e| e.max_across_flashblocks)
-            .collect();
+        // Collect per-block max estimates. Propagate any errors.
+        let mut block_estimates = Vec::new();
+        for &n in &block_numbers {
+            if let Some(est) = self.estimate_for_block(Some(n), demand)? {
+                block_estimates.push(est.max_across_flashblocks);
+            }
+        }
 
         if block_estimates.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Compute median fee for each resource across blocks.
@@ -324,129 +417,148 @@ impl PriorityFeeEstimator {
         }
 
         if estimates.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        Some(RollingPriorityEstimates {
+        Ok(Some(RollingPriorityEstimates {
             blocks_sampled: block_numbers.len(),
             estimates,
             recommended_priority_fee: max_fee,
-        })
+        }))
     }
 }
 
-/// Internal result from the core estimation algorithm.
-#[derive(Debug, Clone)]
-struct ComputedEstimate {
-    threshold_priority_fee: U256,
-    recommended_priority_fee: U256,
-    cumulative_usage: u128,
-    supporting_transactions: usize,
-    total_transactions: usize,
-}
-
-/// Computes a fee estimate for a single resource type.
+/// Core estimation algorithm (top-down approach).
 ///
-/// Thin wrapper around [`compute_estimate_core`] that converts the result
-/// to a [`ResourceEstimate`].
-fn compute_resource_estimate(
-    transactions: &[MeteredTransaction],
-    demand: u128,
-    usage_fn: fn(&MeteredTransaction) -> u128,
-    percentile: f64,
-) -> Option<ResourceEstimate> {
-    if transactions.is_empty() || demand == 0 {
-        return None;
-    }
-
-    let computed = compute_estimate_core(transactions, demand, usage_fn, percentile)?;
-    Some(ResourceEstimate {
-        threshold_priority_fee: computed.threshold_priority_fee,
-        recommended_priority_fee: computed.recommended_priority_fee,
-        cumulative_usage: computed.cumulative_usage,
-        supporting_transactions: computed.supporting_transactions,
-        total_transactions: computed.total_transactions,
-    })
-}
-
-/// Core estimation algorithm.
-///
-/// Given a list of transactions sorted by priority fee (ascending) and a resource
-/// demand, determines the minimum priority fee needed to "displace" enough existing
-/// transactions to free up the required capacity.
+/// Given a list of transactions and a resource limit, determines the minimum priority
+/// fee needed to be included alongside enough high-paying transactions while still
+/// leaving room for the bundle's demand.
 ///
 /// # Algorithm
 ///
-/// 1. Walk transactions from lowest to highest priority fee, accumulating resource usage.
-/// 2. Stop when cumulative usage >= demand. This transaction's fee is the **threshold**:
-///    paying at least this much would displace all lower-fee transactions.
-/// 3. The **recommended** fee is chosen from transactions above the threshold at the
-///    given percentile, providing a safety margin.
+/// 1. Sort transactions from highest to lowest priority fee.
+/// 2. Walk from the top, subtracting each transaction's usage from remaining capacity.
+/// 3. Stop when including another transaction would leave less capacity than the bundle needs.
+/// 4. The threshold fee is the fee of the last included transaction (the minimum fee
+///    among transactions that would be included alongside the bundle).
+/// 5. If we include all transactions and still have capacity >= demand, the resource is
+///    not congested, so return the configured default fee.
 ///
 /// # Example
 ///
 /// ```text
-/// Transactions (sorted by priority_fee ascending):
-///   tx0: priority=1, gas=10
-///   tx1: priority=2, gas=10
-///   tx2: priority=3, gas=10
+/// Resource limit: 30 gas
+/// Bundle demand: 15 gas
 ///
-/// Demand: 15 gas
+/// Transactions (sorted by priority_fee descending):
+///   tx0: priority=10, gas=10
+///   tx1: priority=5,  gas=10
+///   tx2: priority=2,  gas=10
 ///
-/// Walk:
-///   cumulative=10 after tx0 (not enough)
-///   cumulative=20 after tx1 (>= 15, threshold found)
+/// Walk from top:
+///   remaining = 30 - 10 = 20 after tx0 (20 >= 15, can still fit bundle)
+///   remaining = 20 - 10 = 10 after tx1 (10 < 15, can't fit bundle → stop before tx1)
 ///
-/// threshold_fee = 2 (tx1's fee)
-/// remaining = [tx2]
-/// recommended_fee = 3 (50th percentile of remaining)
+/// threshold_fee = 10 (tx0's fee, the last transaction we could include)
 /// ```
-fn compute_estimate_core(
+/// Returns `Err` if the bundle's demand exceeds the resource limit.
+fn compute_estimate(
+    resource: ResourceKind,
     transactions: &[MeteredTransaction],
     demand: u128,
+    limit: u128,
     usage_fn: fn(&MeteredTransaction) -> u128,
     percentile: f64,
-) -> Option<ComputedEstimate> {
-    if transactions.is_empty() {
-        return None;
+    default_fee: U256,
+) -> Result<ResourceEstimate, EstimateError> {
+    // Bundle demand exceeds the resource limit entirely.
+    if demand > limit {
+        return Err(EstimateError::DemandExceedsCapacity {
+            resource,
+            demand,
+            limit,
+        });
     }
 
-    // Walk transactions low-to-high, accumulating resource usage until we have
-    // enough capacity to satisfy the bundle's demand.
-    let mut cumulative = 0u128;
-    let mut threshold_idx = None;
-    for (idx, tx) in transactions.iter().enumerate() {
-        cumulative = cumulative.saturating_add(usage_fn(tx));
-        if cumulative >= demand {
-            threshold_idx = Some(idx);
+    // No transactions or zero demand means no competition for this resource.
+    if transactions.is_empty() || demand == 0 {
+        return Ok(ResourceEstimate {
+            threshold_priority_fee: default_fee,
+            recommended_priority_fee: default_fee,
+            cumulative_usage: 0,
+            supporting_transactions: 0,
+            total_transactions: 0,
+        });
+    }
+
+    // Sort transactions by priority fee descending (highest first).
+    let mut sorted: Vec<_> = transactions.iter().collect();
+    sorted.sort_by(|a, b| b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas));
+
+    // Walk from highest-paying transactions, subtracting usage from remaining capacity.
+    // Stop when we can no longer fit another transaction while leaving room for demand.
+    let mut remaining = limit;
+    let mut included_usage = 0u128;
+    let mut last_included_idx: Option<usize> = None;
+
+    for (idx, tx) in sorted.iter().enumerate() {
+        let usage = usage_fn(tx);
+
+        // Check if we can include this transaction and still have room for the bundle.
+        if remaining >= usage && remaining.saturating_sub(usage) >= demand {
+            remaining = remaining.saturating_sub(usage);
+            included_usage = included_usage.saturating_add(usage);
+            last_included_idx = Some(idx);
+        } else {
+            // Can't include this transaction without crowding out the bundle.
             break;
         }
     }
 
-    // If we never accumulated enough, the bundle's demand exceeds total capacity.
-    let idx = threshold_idx?;
+    // If we included all transactions and still have room, resource is not congested.
+    let is_uncongested = last_included_idx == Some(sorted.len() - 1) && remaining >= demand;
 
-    // The threshold fee is the priority fee of the transaction where we crossed
-    // the demand threshold. Paying this much displaces all transactions below.
-    let threshold_fee = transactions[idx].priority_fee_per_gas;
+    if is_uncongested {
+        return Ok(ResourceEstimate {
+            threshold_priority_fee: default_fee,
+            recommended_priority_fee: default_fee,
+            cumulative_usage: included_usage,
+            supporting_transactions: sorted.len(),
+            total_transactions: sorted.len(),
+        });
+    }
 
-    // For the recommended fee, look at transactions above the threshold and pick
-    // one at the specified percentile. This provides a buffer above the minimum.
-    let remaining = &transactions[idx + 1..];
-    let percentile = percentile.clamp(0.0, 1.0);
-    let recommended_fee = if remaining.is_empty() {
-        threshold_fee
-    } else {
-        let pos = ((remaining.len() - 1) as f64 * percentile).round() as usize;
-        remaining[pos.min(remaining.len() - 1)].priority_fee_per_gas
+    let (threshold_idx, threshold_fee) = match last_included_idx {
+        Some(idx) => {
+            // At least one transaction fits alongside the bundle.
+            // The threshold is the fee of the last included transaction.
+            (idx, sorted[idx].priority_fee_per_gas)
+        }
+        None => {
+            // No transactions fit - even the first transaction would crowd out
+            // the bundle. The bundle must beat the highest fee to be included.
+            (0, sorted[0].priority_fee_per_gas)
+        }
     };
 
-    Some(ComputedEstimate {
+    // For recommended fee, look at included transactions (those above threshold)
+    // and pick one at the specified percentile for a safety margin.
+    let included = &sorted[..=threshold_idx];
+    let percentile = percentile.clamp(0.0, 1.0);
+    let recommended_fee = if included.len() <= 1 {
+        threshold_fee
+    } else {
+        // Pick from the higher end of included transactions for safety.
+        let pos = ((included.len() - 1) as f64 * (1.0 - percentile)).round() as usize;
+        included[pos.min(included.len() - 1)].priority_fee_per_gas
+    };
+
+    Ok(ResourceEstimate {
         threshold_priority_fee: threshold_fee,
         recommended_priority_fee: recommended_fee,
-        cumulative_usage: cumulative,
-        supporting_transactions: idx + 1,
-        total_transactions: transactions.len(),
+        cumulative_usage: included_usage,
+        supporting_transactions: threshold_idx + 1,
+        total_transactions: sorted.len(),
     })
 }
 
@@ -478,8 +590,7 @@ fn compute_min_max_estimates(
             // Update min.
             let current_min = min_estimates.get(resource);
             if current_min.is_none()
-                || estimate.recommended_priority_fee
-                    < current_min.unwrap().recommended_priority_fee
+                || estimate.recommended_priority_fee < current_min.unwrap().recommended_priority_fee
             {
                 min_estimates.set(resource, estimate.clone());
             }
@@ -487,8 +598,7 @@ fn compute_min_max_estimates(
             // Update max.
             let current_max = max_estimates.get(resource);
             if current_max.is_none()
-                || estimate.recommended_priority_fee
-                    > current_max.unwrap().recommended_priority_fee
+                || estimate.recommended_priority_fee > current_max.unwrap().recommended_priority_fee
             {
                 max_estimates.set(resource, estimate.clone());
             }
@@ -503,6 +613,8 @@ mod tests {
     use super::*;
     use alloy_primitives::U256;
 
+    const DEFAULT_FEE: U256 = U256::from_limbs([1, 0, 0, 0]); // 1 wei
+
     fn tx(priority: u64, usage: u64) -> MeteredTransaction {
         MeteredTransaction {
             tx_hash: Default::default(),
@@ -515,13 +627,152 @@ mod tests {
     }
 
     #[test]
-    fn compute_estimate_basic() {
-        let txs = vec![tx(1, 10), tx(2, 10), tx(3, 10)];
-        let quote = compute_estimate_core(&txs, 15, usage_extractor(ResourceKind::GasUsed), 0.5)
-            .expect("quote");
-        assert_eq!(quote.threshold_priority_fee, U256::from(2));
-        assert_eq!(quote.recommended_priority_fee, U256::from(3));
-        assert_eq!(quote.cumulative_usage, 20);
-        assert_eq!(quote.supporting_transactions, 2);
+    fn compute_estimate_congested_resource() {
+        // Limit: 30, Demand: 15
+        // Transactions: priority=10 (10 gas), priority=5 (10 gas), priority=2 (10 gas)
+        // Walking from top (highest fee):
+        //   - Include tx priority=10: remaining = 30-10 = 20 >= 15 ✓
+        //   - Include tx priority=5:  remaining = 20-10 = 10 < 15 ✗ (stop)
+        // Threshold = 10 (the last included tx's fee)
+        let txs = vec![tx(10, 10), tx(5, 10), tx(2, 10)];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            15,
+            30, // limit
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        assert_eq!(quote.threshold_priority_fee, U256::from(10));
+        assert_eq!(quote.cumulative_usage, 10); // Only the first tx was included
+        assert_eq!(quote.supporting_transactions, 1);
+        assert_eq!(quote.total_transactions, 3);
+    }
+
+    #[test]
+    fn compute_estimate_uncongested_resource() {
+        // Limit: 100, Demand: 15
+        // All transactions fit with room to spare → return default fee
+        let txs = vec![tx(10, 10), tx(5, 10), tx(2, 10)];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            15,
+            100, // limit is much larger than total usage
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        assert_eq!(quote.threshold_priority_fee, DEFAULT_FEE);
+        assert_eq!(quote.recommended_priority_fee, DEFAULT_FEE);
+        assert_eq!(quote.cumulative_usage, 30); // All txs included
+        assert_eq!(quote.supporting_transactions, 3);
+    }
+
+    #[test]
+    fn compute_estimate_demand_exceeds_limit() {
+        // Demand > Limit → Error
+        let txs = vec![tx(10, 10), tx(5, 10)];
+        let result = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            50, // demand
+            30, // limit
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        );
+        assert!(matches!(
+            result,
+            Err(EstimateError::DemandExceedsCapacity {
+                resource: ResourceKind::GasUsed,
+                demand: 50,
+                limit: 30,
+            })
+        ));
+    }
+
+    #[test]
+    fn compute_estimate_exact_fit() {
+        // Limit: 30, Demand: 20
+        // Transactions: priority=10 (10 gas), priority=5 (10 gas)
+        // After including tx priority=10: remaining = 20 >= 20 ✓
+        // After including tx priority=5: remaining = 10 < 20 ✗
+        let txs = vec![tx(10, 10), tx(5, 10)];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            20,
+            30,
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        assert_eq!(quote.threshold_priority_fee, U256::from(10));
+        assert_eq!(quote.cumulative_usage, 10);
+        assert_eq!(quote.supporting_transactions, 1);
+    }
+
+    #[test]
+    fn compute_estimate_single_transaction() {
+        // Single tx that fits
+        let txs = vec![tx(10, 10)];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            15,
+            30,
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        // After including the tx: remaining = 20 >= 15 ✓
+        // But we only have 1 tx, so it's uncongested
+        assert_eq!(quote.threshold_priority_fee, DEFAULT_FEE);
+        assert_eq!(quote.recommended_priority_fee, DEFAULT_FEE);
+    }
+
+    #[test]
+    fn compute_estimate_no_room_for_any_tx() {
+        // Limit: 25, Demand: 20
+        // First tx uses 10, remaining = 15 < 20 → can't even include first tx
+        let txs = vec![tx(10, 10), tx(5, 10)];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            20,
+            25,
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        // Need to beat the highest fee since we couldn't include any tx
+        assert_eq!(quote.threshold_priority_fee, U256::from(10));
+        assert_eq!(quote.cumulative_usage, 0);
+        assert_eq!(quote.supporting_transactions, 1); // Reports first tx as threshold
+    }
+
+    #[test]
+    fn compute_estimate_empty_transactions() {
+        // No transactions = uncongested, return default fee
+        let txs: Vec<MeteredTransaction> = vec![];
+        let quote = compute_estimate(
+            ResourceKind::GasUsed,
+            &txs,
+            15,
+            30,
+            usage_extractor(ResourceKind::GasUsed),
+            0.5,
+            DEFAULT_FEE,
+        )
+        .expect("no error");
+        assert_eq!(quote.threshold_priority_fee, DEFAULT_FEE);
+        assert_eq!(quote.recommended_priority_fee, DEFAULT_FEE);
     }
 }

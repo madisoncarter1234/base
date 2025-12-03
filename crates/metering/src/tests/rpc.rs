@@ -1,9 +1,14 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        DEFAULT_PRIORITY_FEE_PERCENTILE, MeteringApiImpl, MeteringApiServer, MeteringCache,
-        PriorityFeeEstimator,
+        MeteringApiImpl, MeteringApiServer, MeteringCache, PriorityFeeEstimator, ResourceLimits,
     };
+
+    const PRIORITY_FEE_PERCENTILE: f64 = 0.5;
+    const GAS_LIMIT: u64 = 30_000_000;
+    const EXECUTION_TIME_US: u128 = 50_000;
+    const DA_BYTES: u64 = 120_000;
+    const UNCONGESTED_PRIORITY_FEE: u64 = 1;
     use alloy_eips::Encodable2718;
     use alloy_genesis::Genesis;
     use alloy_primitives::bytes;
@@ -87,9 +92,17 @@ mod tests {
         let node = OpNode::new(RollupArgs::default());
 
         let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
+        let limits = ResourceLimits {
+            gas_used: Some(GAS_LIMIT),
+            execution_time_us: Some(EXECUTION_TIME_US),
+            state_root_time_us: None,
+            data_availability_bytes: Some(DA_BYTES),
+        };
         let estimator = Arc::new(PriorityFeeEstimator::new(
             cache.clone(),
-            DEFAULT_PRIORITY_FEE_PERCENTILE,
+            PRIORITY_FEE_PERCENTILE,
+            limits,
+            U256::from(UNCONGESTED_PRIORITY_FEE),
         ));
         let estimator_for_rpc = estimator.clone();
 
