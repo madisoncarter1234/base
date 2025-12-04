@@ -611,13 +611,23 @@ fn compute_min_max_estimates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::U256;
+    use alloy_primitives::{B256, U256};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     const DEFAULT_FEE: U256 = U256::from_limbs([1, 0, 0, 0]); // 1 wei
+    const DEFAULT_LIMITS: ResourceLimits = ResourceLimits {
+        gas_used: Some(25),
+        execution_time_us: Some(100),
+        state_root_time_us: None,
+        data_availability_bytes: Some(100),
+    };
 
     fn tx(priority: u64, usage: u64) -> MeteredTransaction {
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[24..].copy_from_slice(&priority.to_be_bytes());
         MeteredTransaction {
-            tx_hash: Default::default(),
+            tx_hash: B256::new(hash_bytes),
             priority_fee_per_gas: U256::from(priority),
             gas_used: usage,
             execution_time_us: usage as u128,
@@ -774,5 +784,91 @@ mod tests {
         .expect("no error");
         assert_eq!(quote.threshold_priority_fee, DEFAULT_FEE);
         assert_eq!(quote.recommended_priority_fee, DEFAULT_FEE);
+    }
+
+    fn setup_estimator(
+        limits: ResourceLimits,
+    ) -> (Arc<RwLock<MeteringCache>>, PriorityFeeEstimator) {
+        let cache = Arc::new(RwLock::new(MeteringCache::new(4)));
+        let estimator = PriorityFeeEstimator::new(cache.clone(), 0.5, limits, DEFAULT_FEE);
+        (cache, estimator)
+    }
+
+    #[test]
+    fn estimate_for_block_respects_limits() {
+        let (cache, estimator) = setup_estimator(DEFAULT_LIMITS);
+        {
+            let mut guard = cache.write();
+            guard.upsert_transaction(1, 0, tx(10, 10));
+            guard.upsert_transaction(1, 0, tx(5, 10));
+        }
+        let mut demand = ResourceDemand::default();
+        demand.gas_used = Some(15);
+
+        let estimates = estimator
+            .estimate_for_block(Some(1), demand)
+            .expect("no error")
+            .expect("cached block");
+
+        assert_eq!(estimates.block_number, 1);
+        let gas_estimate = estimates
+            .max_across_flashblocks
+            .gas_used
+            .expect("gas estimate present");
+        assert_eq!(gas_estimate.threshold_priority_fee, U256::from(10));
+    }
+
+    #[test]
+    fn estimate_for_block_propagates_limit_errors() {
+        let mut limits = DEFAULT_LIMITS;
+        limits.gas_used = Some(10);
+        let (cache, estimator) = setup_estimator(limits);
+        {
+            let mut guard = cache.write();
+            guard.upsert_transaction(1, 0, tx(10, 10));
+            guard.upsert_transaction(1, 0, tx(5, 10));
+        }
+        let mut demand = ResourceDemand::default();
+        demand.gas_used = Some(15);
+
+        let err = estimator
+            .estimate_for_block(Some(1), demand)
+            .expect_err("demand should exceed capacity");
+        assert!(matches!(
+            err,
+            EstimateError::DemandExceedsCapacity {
+                resource: ResourceKind::GasUsed,
+                demand: 15,
+                limit: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn estimate_rolling_aggregates_across_blocks() {
+        let (cache, estimator) = setup_estimator(DEFAULT_LIMITS);
+        {
+            let mut guard = cache.write();
+            // Block 1 → threshold 10
+            guard.upsert_transaction(1, 0, tx(10, 10));
+            guard.upsert_transaction(1, 0, tx(5, 10));
+            // Block 2 → threshold 30
+            guard.upsert_transaction(2, 0, tx(30, 10));
+            guard.upsert_transaction(2, 0, tx(25, 10));
+        }
+
+        let mut demand = ResourceDemand::default();
+        demand.gas_used = Some(15);
+
+        let rolling = estimator
+            .estimate_rolling(demand)
+            .expect("no error")
+            .expect("estimates available");
+
+        assert_eq!(rolling.blocks_sampled, 2);
+        let gas_estimate = rolling.estimates.gas_used.expect("gas estimate present");
+        // Median across [10, 30] = 30 (upper median for even count)
+        assert_eq!(gas_estimate.recommended_priority_fee, U256::from(30));
+        assert_eq!(rolling.recommended_priority_fee, U256::from(30));
     }
 }
