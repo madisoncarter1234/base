@@ -18,5 +18,7 @@ pub use estimator::{
 };
 pub use kafka::{KafkaBundleConsumer, KafkaBundleConsumerConfig};
 pub use meter::meter_bundle;
-pub use rpc::{MeteredPriorityFeeResponse, MeteringApiImpl, MeteringApiServer};
+pub use rpc::{
+    MeteredPriorityFeeResponse, MeteringApiImpl, MeteringApiServer, ResourceFeeEstimateResponse,
+};
 pub use tips_core::types::{Bundle, MeterBundleResponse, TransactionResult};

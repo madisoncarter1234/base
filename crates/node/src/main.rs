@@ -21,6 +21,9 @@ const DEFAULT_EXECUTION_TIME_US: u128 = 50_000;
 /// Default data availability limit per flashblock in bytes (120KB).
 const DEFAULT_DA_BYTES: u64 = 120_000;
 
+/// Default state root time budget per block in microseconds (disabled by default).
+const DEFAULT_STATE_ROOT_TIME_US: Option<u128> = None;
+
 /// Default priority fee returned when a resource is not congested (1 wei).
 const DEFAULT_UNCONGESTED_PRIORITY_FEE: u64 = 1;
 
@@ -108,6 +111,11 @@ struct Args {
     #[arg(long = "metering-execution-time-us", default_value_t = DEFAULT_EXECUTION_TIME_US)]
     pub metering_execution_time_us: u128,
 
+    /// State root time budget per block in microseconds for priority fee estimation.
+    /// Not used until per-transaction state-root timing is available in the TIPS Kafka schema.
+    #[arg(long = "metering-state-root-time-us")]
+    pub metering_state_root_time_us: Option<u128>,
+
     /// Data availability limit per flashblock in bytes for priority fee estimation.
     #[arg(long = "metering-da-bytes", default_value_t = DEFAULT_DA_BYTES)]
     pub metering_da_bytes: u64,
@@ -162,7 +170,6 @@ struct MeteringKafkaSettings {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct MeteringRuntime {
     cache: Arc<RwLock<MeteringCache>>,
     estimator: Arc<PriorityFeeEstimator>,
@@ -285,7 +292,7 @@ fn main() {
                 let limits = ResourceLimits {
                     gas_used: Some(args.metering_gas_limit),
                     execution_time_us: Some(args.metering_execution_time_us),
-                    state_root_time_us: None,
+                    state_root_time_us: args.metering_state_root_time_us,
                     data_availability_bytes: Some(args.metering_da_bytes),
                 };
                 let estimator = Arc::new(PriorityFeeEstimator::new(

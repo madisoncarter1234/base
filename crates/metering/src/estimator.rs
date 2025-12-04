@@ -137,10 +137,11 @@ pub struct ResourceEstimate {
     /// Recommended fee based on a percentile of transactions above the threshold.
     /// Provides a safety margin over the bare minimum.
     pub recommended_priority_fee: U256,
-    /// Total resource usage of transactions at or below the threshold.
+    /// Total resource usage of transactions at or above the threshold fee.
     pub cumulative_usage: u128,
-    /// Number of transactions that would be displaced at the threshold fee.
-    pub supporting_transactions: usize,
+    /// Number of transactions at or above `threshold_priority_fee`. These higher-paying
+    /// transactions remain included alongside the bundle; lower-paying ones are displaced.
+    pub threshold_tx_count: usize,
     /// Total transactions considered in the estimate.
     pub total_transactions: usize,
 }
@@ -282,6 +283,7 @@ impl PriorityFeeEstimator {
         // Materialise sorted transactions per flashblock so we can drop the lock before
         // running the estimation logic.
         let mut flashblock_transactions = Vec::new();
+        let mut total_tx_count = 0usize;
         for flashblock in block_metrics.flashblocks() {
             let sorted: Vec<MeteredTransaction> = flashblock
                 .transactions_sorted_by_priority_fee()
@@ -291,6 +293,7 @@ impl PriorityFeeEstimator {
             if sorted.is_empty() {
                 continue;
             }
+            total_tx_count += sorted.len();
             flashblock_transactions.push((flashblock.flashblock_index, sorted));
         }
         drop(cache_guard);
@@ -299,16 +302,20 @@ impl PriorityFeeEstimator {
             return Ok(None);
         }
 
-        // Flatten into a single list for use-it-or-lose-it resources.
-        let mut aggregate_transactions: Vec<MeteredTransaction> = flashblock_transactions
-            .iter()
-            .flat_map(|(_, txs)| txs.iter().cloned())
-            .collect();
-        aggregate_transactions.sort_by(|a, b| a.priority_fee_per_gas.cmp(&b.priority_fee_per_gas));
+        // Build the aggregate list for use-it-or-lose-it resources by collecting references
+        // to avoid cloning transactions twice.
+        let mut aggregate_refs: Vec<&MeteredTransaction> = Vec::with_capacity(total_tx_count);
+        for (_, txs) in &flashblock_transactions {
+            aggregate_refs.extend(txs.iter());
+        }
+        aggregate_refs.sort_by(|a, b| a.priority_fee_per_gas.cmp(&b.priority_fee_per_gas));
 
         let mut flashblock_estimates = Vec::new();
 
-        for (flashblock_index, txs) in flashblock_transactions {
+        for (flashblock_index, txs) in &flashblock_transactions {
+            // Build a reference slice for this flashblock's transactions.
+            let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
+
             let mut estimates = ResourceEstimates::default();
             for resource in ResourceKind::all() {
                 let Some(demand_value) = demand.demand_for(resource) else {
@@ -318,10 +325,10 @@ impl PriorityFeeEstimator {
                     continue;
                 };
 
-                let transactions = if resource.use_it_or_lose_it() {
-                    &aggregate_transactions
+                let transactions: &[&MeteredTransaction] = if resource.use_it_or_lose_it() {
+                    &aggregate_refs
                 } else {
-                    &txs
+                    &txs_refs
                 };
                 let estimate = compute_estimate(
                     resource,
@@ -337,7 +344,7 @@ impl PriorityFeeEstimator {
             }
 
             flashblock_estimates.push(FlashblockResourceEstimates {
-                flashblock_index,
+                flashblock_index: *flashblock_index,
                 estimates,
             });
         }
@@ -410,7 +417,7 @@ impl PriorityFeeEstimator {
                     threshold_priority_fee: median_fee,
                     recommended_priority_fee: median_fee,
                     cumulative_usage: 0,
-                    supporting_transactions: 0,
+                    threshold_tx_count: 0,
                     total_transactions: 0,
                 },
             );
@@ -464,7 +471,7 @@ impl PriorityFeeEstimator {
 /// Returns `Err` if the bundle's demand exceeds the resource limit.
 fn compute_estimate(
     resource: ResourceKind,
-    transactions: &[MeteredTransaction],
+    transactions: &[&MeteredTransaction],
     demand: u128,
     limit: u128,
     usage_fn: fn(&MeteredTransaction) -> u128,
@@ -486,13 +493,13 @@ fn compute_estimate(
             threshold_priority_fee: default_fee,
             recommended_priority_fee: default_fee,
             cumulative_usage: 0,
-            supporting_transactions: 0,
+            threshold_tx_count: 0,
             total_transactions: 0,
         });
     }
 
     // Sort transactions by priority fee descending (highest first).
-    let mut sorted: Vec<_> = transactions.iter().collect();
+    let mut sorted: Vec<_> = transactions.to_vec();
     sorted.sort_by(|a, b| b.priority_fee_per_gas.cmp(&a.priority_fee_per_gas));
 
     // Walk from highest-paying transactions, subtracting usage from remaining capacity.
@@ -523,41 +530,45 @@ fn compute_estimate(
             threshold_priority_fee: default_fee,
             recommended_priority_fee: default_fee,
             cumulative_usage: included_usage,
-            supporting_transactions: sorted.len(),
+            threshold_tx_count: sorted.len(),
             total_transactions: sorted.len(),
         });
     }
 
-    let (threshold_idx, threshold_fee) = match last_included_idx {
+    let (supporting_count, threshold_fee, recommended_fee) = match last_included_idx {
         Some(idx) => {
             // At least one transaction fits alongside the bundle.
             // The threshold is the fee of the last included transaction.
-            (idx, sorted[idx].priority_fee_per_gas)
+            let threshold_fee = sorted[idx].priority_fee_per_gas;
+
+            // For recommended fee, look at included transactions (those above threshold)
+            // and pick one at the specified percentile for a safety margin.
+            let included = &sorted[..=idx];
+            let percentile = percentile.clamp(0.0, 1.0);
+            let recommended_fee = if included.len() <= 1 {
+                threshold_fee
+            } else {
+                // Pick from the higher end of included transactions for safety.
+                let pos = ((included.len() - 1) as f64 * (1.0 - percentile)).round() as usize;
+                included[pos.min(included.len() - 1)].priority_fee_per_gas
+            };
+
+            (idx + 1, threshold_fee, recommended_fee)
         }
         None => {
             // No transactions fit - even the first transaction would crowd out
             // the bundle. The bundle must beat the highest fee to be included.
-            (0, sorted[0].priority_fee_per_gas)
+            // Report 0 supporting transactions since none were actually included.
+            let threshold_fee = sorted[0].priority_fee_per_gas;
+            (0, threshold_fee, threshold_fee)
         }
-    };
-
-    // For recommended fee, look at included transactions (those above threshold)
-    // and pick one at the specified percentile for a safety margin.
-    let included = &sorted[..=threshold_idx];
-    let percentile = percentile.clamp(0.0, 1.0);
-    let recommended_fee = if included.len() <= 1 {
-        threshold_fee
-    } else {
-        // Pick from the higher end of included transactions for safety.
-        let pos = ((included.len() - 1) as f64 * (1.0 - percentile)).round() as usize;
-        included[pos.min(included.len() - 1)].priority_fee_per_gas
     };
 
     Ok(ResourceEstimate {
         threshold_priority_fee: threshold_fee,
         recommended_priority_fee: recommended_fee,
         cumulative_usage: included_usage,
-        supporting_transactions: threshold_idx + 1,
+        threshold_tx_count: supporting_count,
         total_transactions: sorted.len(),
     })
 }
@@ -645,9 +656,10 @@ mod tests {
         //   - Include tx priority=5:  remaining = 20-10 = 10 < 15 ✗ (stop)
         // Threshold = 10 (the last included tx's fee)
         let txs = vec![tx(10, 10), tx(5, 10), tx(2, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             15,
             30, // limit
             usage_extractor(ResourceKind::GasUsed),
@@ -657,7 +669,7 @@ mod tests {
         .expect("no error");
         assert_eq!(quote.threshold_priority_fee, U256::from(10));
         assert_eq!(quote.cumulative_usage, 10); // Only the first tx was included
-        assert_eq!(quote.supporting_transactions, 1);
+        assert_eq!(quote.threshold_tx_count, 1);
         assert_eq!(quote.total_transactions, 3);
     }
 
@@ -666,9 +678,10 @@ mod tests {
         // Limit: 100, Demand: 15
         // All transactions fit with room to spare → return default fee
         let txs = vec![tx(10, 10), tx(5, 10), tx(2, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             15,
             100, // limit is much larger than total usage
             usage_extractor(ResourceKind::GasUsed),
@@ -679,16 +692,17 @@ mod tests {
         assert_eq!(quote.threshold_priority_fee, DEFAULT_FEE);
         assert_eq!(quote.recommended_priority_fee, DEFAULT_FEE);
         assert_eq!(quote.cumulative_usage, 30); // All txs included
-        assert_eq!(quote.supporting_transactions, 3);
+        assert_eq!(quote.threshold_tx_count, 3);
     }
 
     #[test]
     fn compute_estimate_demand_exceeds_limit() {
         // Demand > Limit → Error
         let txs = vec![tx(10, 10), tx(5, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let result = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             50, // demand
             30, // limit
             usage_extractor(ResourceKind::GasUsed),
@@ -712,9 +726,10 @@ mod tests {
         // After including tx priority=10: remaining = 20 >= 20 ✓
         // After including tx priority=5: remaining = 10 < 20 ✗
         let txs = vec![tx(10, 10), tx(5, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             20,
             30,
             usage_extractor(ResourceKind::GasUsed),
@@ -724,16 +739,17 @@ mod tests {
         .expect("no error");
         assert_eq!(quote.threshold_priority_fee, U256::from(10));
         assert_eq!(quote.cumulative_usage, 10);
-        assert_eq!(quote.supporting_transactions, 1);
+        assert_eq!(quote.threshold_tx_count, 1);
     }
 
     #[test]
     fn compute_estimate_single_transaction() {
         // Single tx that fits
         let txs = vec![tx(10, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             15,
             30,
             usage_extractor(ResourceKind::GasUsed),
@@ -752,9 +768,10 @@ mod tests {
         // Limit: 25, Demand: 20
         // First tx uses 10, remaining = 15 < 20 → can't even include first tx
         let txs = vec![tx(10, 10), tx(5, 10)];
+        let txs_refs: Vec<&MeteredTransaction> = txs.iter().collect();
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             20,
             25,
             usage_extractor(ResourceKind::GasUsed),
@@ -765,16 +782,16 @@ mod tests {
         // Need to beat the highest fee since we couldn't include any tx
         assert_eq!(quote.threshold_priority_fee, U256::from(10));
         assert_eq!(quote.cumulative_usage, 0);
-        assert_eq!(quote.supporting_transactions, 1); // Reports first tx as threshold
+        assert_eq!(quote.threshold_tx_count, 0); // No transactions can coexist
     }
 
     #[test]
     fn compute_estimate_empty_transactions() {
         // No transactions = uncongested, return default fee
-        let txs: Vec<MeteredTransaction> = vec![];
+        let txs_refs: Vec<&MeteredTransaction> = vec![];
         let quote = compute_estimate(
             ResourceKind::GasUsed,
-            &txs,
+            &txs_refs,
             15,
             30,
             usage_extractor(ResourceKind::GasUsed),

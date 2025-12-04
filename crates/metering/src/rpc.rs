@@ -27,7 +27,7 @@ pub struct ResourceFeeEstimateResponse {
     pub threshold_priority_fee: String,
     pub recommended_priority_fee: String,
     pub cumulative_usage: String,
-    pub supporting_transactions: u64,
+    pub threshold_tx_count: u64,
     pub total_transactions: u64,
 }
 
@@ -256,10 +256,7 @@ fn to_response(resource: ResourceKind, estimate: &ResourceEstimate) -> ResourceF
         threshold_priority_fee: estimate.threshold_priority_fee.to_string(),
         recommended_priority_fee: estimate.recommended_priority_fee.to_string(),
         cumulative_usage: estimate.cumulative_usage.to_string(),
-        supporting_transactions: estimate
-            .supporting_transactions
-            .try_into()
-            .unwrap_or(u64::MAX),
+        threshold_tx_count: estimate.threshold_tx_count.try_into().unwrap_or(u64::MAX),
         total_transactions: estimate.total_transactions.try_into().unwrap_or(u64::MAX),
     }
 }

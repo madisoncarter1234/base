@@ -273,12 +273,15 @@ impl MeteringCache {
     }
 
     fn evict_if_needed(&mut self) {
+        let mut evicted = false;
         while self.blocks.len() > self.max_blocks {
             if let Some(oldest) = self.blocks.pop_front() {
                 self.block_index.remove(&oldest.block_number);
+                evicted = true;
             }
-
-            // Rebuild index to maintain correctness.
+        }
+        // Rebuild index once after all evictions to maintain correctness.
+        if evicted {
             self.rebuild_index();
         }
     }
