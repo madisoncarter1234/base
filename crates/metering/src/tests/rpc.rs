@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        MeteringApiImpl, MeteringApiServer, MeteringCache, PriorityFeeEstimator, ResourceLimits,
+        MeteredTransaction, MeteringApiImpl, MeteringApiServer, MeteringCache,
+        PriorityFeeEstimator, ResourceLimits,
     };
 
     const PRIORITY_FEE_PERCENTILE: f64 = 0.5;
@@ -21,9 +22,11 @@ mod tests {
     use reth::chainspec::Chain;
     use reth::core::exit::NodeExitFuture;
     use reth::tasks::TaskManager;
+    use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
     use reth_optimism_chainspec::OpChainSpecBuilder;
     use reth_optimism_node::OpNode;
     use reth_optimism_node::args::RollupArgs;
+    use reth_optimism_payload_builder::config::OpDAConfig;
     use reth_optimism_primitives::OpTransactionSigned;
     use reth_provider::providers::BlockchainProvider;
     use reth_transaction_pool::test_utils::TransactionBuilder;
@@ -35,6 +38,7 @@ mod tests {
 
     pub struct NodeContext {
         http_api_addr: SocketAddr,
+        cache: Arc<RwLock<MeteringCache>>,
         _node_exit_future: NodeExitFuture,
         _node: Box<dyn Any + Sync + Send>,
     }
@@ -86,10 +90,19 @@ mod tests {
 
         let node_config = NodeConfig::new(chain_spec.clone())
             .with_network(network_config.clone())
-            .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+            .with_rpc(
+                RpcServerArgs::default()
+                    .with_unused_ports()
+                    .with_http()
+                    .with_http_api(RpcModuleSelection::from([RethRpcModule::Miner])),
+            )
             .with_unused_ports();
 
-        let node = OpNode::new(RollupArgs::default());
+        // Create shared DA config that will be used by both the miner RPC and the estimator.
+        // When miner_setMaxDASize is called, the OpDAConfig is updated atomically and
+        // the estimator will see the new limits.
+        let da_config = OpDAConfig::default();
+        let node = OpNode::new(RollupArgs::default()).with_da_config(da_config.clone());
 
         let cache = Arc::new(RwLock::new(MeteringCache::new(12)));
         let limits = ResourceLimits {
@@ -103,6 +116,7 @@ mod tests {
             PRIORITY_FEE_PERCENTILE,
             limits,
             U256::from(UNCONGESTED_PRIORITY_FEE),
+            Some(da_config.clone()),
         ));
         let estimator_for_rpc = estimator.clone();
 
@@ -130,6 +144,7 @@ mod tests {
 
         Ok(NodeContext {
             http_api_addr,
+            cache,
             _node_exit_future: node_exit_future,
             _node: Box::new(node),
         })
@@ -483,6 +498,110 @@ mod tests {
         assert!(
             err_str.contains("Priority fee data unavailable"),
             "unexpected error: {err_str}"
+        );
+
+        Ok(())
+    }
+
+    /// Creates a test transaction with specified priority fee and DA bytes.
+    fn test_tx(priority_fee: u64, da_bytes: u64) -> MeteredTransaction {
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[24..].copy_from_slice(&priority_fee.to_be_bytes());
+        MeteredTransaction {
+            tx_hash: alloy_primitives::B256::new(hash_bytes),
+            priority_fee_per_gas: U256::from(priority_fee),
+            gas_used: 21_000,
+            execution_time_us: 100,
+            state_root_time_us: 0,
+            data_availability_bytes: da_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_max_da_size_updates_priority_fee_estimates() -> eyre::Result<()> {
+        reth_tracing::init_test_tracing();
+        let node = setup_node().await?;
+        let client = node.rpc_client().await?;
+
+        // Create a transaction to include in the bundle for DA demand calculation.
+        // Use a funded account from genesis.json (Hardhat account #0).
+        let sender_secret =
+            b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+        let tx = TransactionBuilder::default()
+            .signer(sender_secret)
+            .chain_id(84532)
+            .nonce(0)
+            .to(address!("0x1111111111111111111111111111111111111111"))
+            .value(1000)
+            .gas_limit(21_000)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(1_000_000_000)
+            .into_eip1559();
+
+        let signed_tx =
+            OpTransactionSigned::Eip1559(tx.as_eip1559().expect("eip1559 transaction").clone());
+        let envelope: OpTxEnvelope = signed_tx.into();
+        let tx_bytes = Bytes::from(envelope.encoded_2718());
+
+        // Populate the cache with test transactions that have known DA bytes.
+        // We'll create a scenario where DA is the constraining resource:
+        //   - tx1: priority=100, DA=50 bytes
+        //   - tx2: priority=50, DA=50 bytes
+        //   - tx3: priority=10, DA=50 bytes
+        // Total DA used by existing transactions = 150 bytes
+        {
+            let mut cache = node.cache.write();
+            cache.upsert_transaction(1, 0, test_tx(100, 50));
+            cache.upsert_transaction(1, 0, test_tx(50, 50));
+            cache.upsert_transaction(1, 0, test_tx(10, 50));
+        }
+
+        // Bundle with our transaction - it will have some DA demand from the tx bytes.
+        let bundle = create_bundle(vec![tx_bytes], 0, None);
+
+        // With default DA limit (120KB = 120_000 bytes), there's plenty of room.
+        // All transactions fit (150 bytes used) plus our bundle's demand.
+        // This should return the uncongested default fee (1 wei).
+        //
+        // Note: We use serde_json::Value because alloy_rpc_client can't deserialize u128 fields
+        // when they're nested in flattened structs. The response contains totalExecutionTimeUs
+        // as u128 which causes deserialization issues.
+        let response: serde_json::Value = client
+            .request("base_meteredPriorityFeePerGas", (bundle.clone(),))
+            .await?;
+
+        let fee_before = response["recommendedPriorityFee"]
+            .as_str()
+            .expect("recommendedPriorityFee should be a string");
+        assert_eq!(
+            fee_before, "1",
+            "with large DA limit, resource should be uncongested"
+        );
+
+        // Now reduce the DA limit to 200 bytes via miner_setMaxDASize.
+        // With 200 byte limit and ~100 byte bundle demand, only ~100 bytes available for others.
+        // tx1 (50) + tx2 (50) = 100 bytes fits, but adding tx3 (50) = 150 bytes exceeds capacity.
+        // So tx3 gets displaced. Threshold fee = tx2's fee = 50.
+        let result: bool = client.request("miner_setMaxDASize", (1000, 200)).await?;
+        assert!(result, "miner_setMaxDASize should succeed");
+
+        // Request priority fee again - now DA should be congested.
+        let response: serde_json::Value = client
+            .request("base_meteredPriorityFeePerGas", (bundle,))
+            .await?;
+
+        // With the reduced limit, we should see a higher recommended fee.
+        // The exact value depends on the percentile calculation, but it should
+        // be significantly higher than the uncongested fee of 1.
+        let fee_after = response["recommendedPriorityFee"]
+            .as_str()
+            .expect("recommendedPriorityFee should be a string");
+        let fee: u64 = fee_after.parse().expect("valid u64");
+        assert!(
+            fee > 1,
+            "with reduced DA limit, recommended fee should be higher than uncongested fee (1), got {}",
+            fee
         );
 
         Ok(())

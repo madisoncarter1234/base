@@ -56,6 +56,7 @@ reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1"
 reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-optimism-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
+reth-optimism-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-optimism-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
@@ -69,6 +70,7 @@ reth-exex = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
+reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 
 # revm
 revm = { version = "31.0.0", default-features = false }

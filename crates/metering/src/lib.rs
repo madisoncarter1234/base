@@ -18,6 +18,7 @@ pub use estimator::{
 };
 pub use kafka::{KafkaBundleConsumer, KafkaBundleConsumerConfig};
 pub use meter::meter_bundle;
+pub use reth_optimism_payload_builder::config::OpDAConfig;
 pub use rpc::{
     MeteredPriorityFeeResponse, MeteringApiImpl, MeteringApiServer, ResourceFeeEstimateResponse,
 };

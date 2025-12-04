@@ -4,8 +4,8 @@ use base_reth_flashblocks_rpc::state::FlashblocksState;
 use base_reth_flashblocks_rpc::subscription::{Flashblock, FlashblocksSubscriber};
 use base_reth_metering::{
     FlashblockInclusion, KafkaBundleConsumer, KafkaBundleConsumerConfig, MeteredTransaction,
-    MeteringApiImpl, MeteringApiServer, MeteringCache, PriorityFeeEstimator, ResourceAnnotator,
-    ResourceLimits,
+    MeteringApiImpl, MeteringApiServer, MeteringCache, OpDAConfig, PriorityFeeEstimator,
+    ResourceAnnotator, ResourceLimits,
 };
 
 /// Default percentile applied when selecting a recommended priority fee among
@@ -49,6 +49,7 @@ use reth_exex::ExExEvent;
 use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
 use reth_optimism_node::OpNode;
 use reth_optimism_node::args::RollupArgs;
+use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 use std::sync::Arc;
 use tips_core::kafka::load_kafka_config_from_file;
 use tokio::sync::mpsc;
@@ -129,12 +130,8 @@ struct Args {
     #[arg(long = "metering-uncongested-priority-fee", default_value_t = DEFAULT_UNCONGESTED_PRIORITY_FEE)]
     pub metering_uncongested_priority_fee: u64,
 
-    /// Number of recent blocks to retain in the metering cache.
-    #[arg(
-        long = "metering-cache-size",
-        default_value_t = DEFAULT_METERING_CACHE_SIZE,
-        value_parser = clap::value_parser!(usize).range(1..)
-    )]
+    /// Number of recent blocks to retain in the metering cache (minimum 1).
+    #[arg(long = "metering-cache-size", default_value_t = DEFAULT_METERING_CACHE_SIZE)]
     pub metering_cache_size: usize,
 }
 
@@ -272,7 +269,7 @@ fn main() {
     .expect("Unable to init version metadata");
 
     Cli::<OpChainSpecParser, Args>::parse()
-        .run(|builder, args| async move {
+        .run(|mut builder, args| async move {
             info!(message = "starting custom Base node");
 
             let flashblocks_enabled = args.flashblocks_enabled();
@@ -285,9 +282,34 @@ fn main() {
                 );
             }
 
-            let op_node = OpNode::new(args.rollup_args.clone());
+            // Create shared DA config for dynamic updates via miner_setMaxDASize RPC.
+            // Both the OpNode (miner RPC) and PriorityFeeEstimator share this config.
+            let da_config = if metering_enabled {
+                // Enable miner RPC module for miner_setMaxDASize when metering is enabled.
+                let updated_api = builder
+                    .config()
+                    .rpc
+                    .http_api
+                    .clone()
+                    .unwrap_or_else(|| RpcModuleSelection::from([]))
+                    .append(RethRpcModule::Miner);
+                builder.config_mut().rpc.http_api = Some(updated_api);
+
+                Some(OpDAConfig::new(0, args.metering_da_bytes))
+            } else {
+                None
+            };
+
+            let op_node = if let Some(ref da_config) = da_config {
+                OpNode::new(args.rollup_args.clone()).with_da_config(da_config.clone())
+            } else {
+                OpNode::new(args.rollup_args.clone())
+            };
 
             let metering_runtime = if metering_enabled {
+                if args.metering_cache_size == 0 {
+                    bail!("--metering-cache-size must be at least 1");
+                }
                 let cache = Arc::new(RwLock::new(MeteringCache::new(args.metering_cache_size)));
                 let limits = ResourceLimits {
                     gas_used: Some(args.metering_gas_limit),
@@ -300,6 +322,7 @@ fn main() {
                     args.metering_priority_fee_percentile,
                     limits,
                     alloy_primitives::U256::from(args.metering_uncongested_priority_fee),
+                    da_config.clone(),
                 ));
 
                 let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<MeteredTransaction>();
